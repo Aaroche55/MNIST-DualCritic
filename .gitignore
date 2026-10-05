@@ -1,0 +1,102 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Experiment outputs
+outputs/
+output/
+runs/
+results/
+checkpoints/
+samples/
+generated_images/
+metrics/
+
+# Model checkpoints and weights
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.npz
+*.pkl
+*.pickle
+*.onnx
+*.mlmodel
+
+# Datasets
+data/
+datasets/
+*.csv
+*.json
+*.jsonl
+*.parquet
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# MLX cache and downloaded model files
+.mlx/
+mlx_cache/
+huggingface/
+.cache/
+.cache/huggingface/
+.cache/torch/
+.cache/mlx/
+
+# Experiment tracking
+wandb/
+lightning_logs/
+tensorboard/
+mlruns/
+aim/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
