@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from mnist-dualcritic!")
+"""MNIST-DualCritic: dataset tooling and models."""

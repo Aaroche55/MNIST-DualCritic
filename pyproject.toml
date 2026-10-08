@@ -15,9 +15,43 @@ dependencies = [
 ]
 
 [project.scripts]
-mnist-dualcritic = "mnist_dualcritic:main"
 data = "mnist_dualcritic.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.16,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "N",       # pep8-naming
+    "UP",      # pyupgrade
+    "B",       # flake8-bugbear
+    "C4",      # flake8-comprehensions
+    "SIM",     # flake8-simplify
+    "RET",     # flake8-return
+    "PTH",     # flake8-use-pathlib
+    "PERF",    # perflint
+    "PT",      # flake8-pytest-style
+    "NPY",     # numpy-specific rules
+    "RUF",     # ruff-specific rules
+]
+# Line length is enforced by `ruff format`; what it can't wrap (long strings such as checksums) is allowed
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+filterwarnings = ["error"]
