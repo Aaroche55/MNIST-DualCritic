@@ -23,12 +23,26 @@ DATA_DIR_FORMATTED_IMAGES = DATA_DIR_FORMATTED / "images.idx3-ubyte"
 
 @dataclass
 class Dataset:
-    images: list
-    labels: list
+    images: np.ndarray  # (N, rows, cols)
+    labels: np.ndarray  # (N,)
+
+    def __post_init__(self):
+        self.images = np.asarray(self.images)
+        self.labels = np.asarray(self.labels)
+        if self.images.ndim != 3:
+            raise ValueError(f"images must have shape (N, rows, cols), got {self.images.shape}")
+        if self.labels.ndim != 1:
+            raise ValueError(f"labels must have shape (N,), got {self.labels.shape}")
+        if len(self.images) != len(self.labels):
+            raise ValueError(f"Dataset sizes do not match: {len(self.images)} images != {len(self.labels)} labels")
+
+    @classmethod
+    def empty(cls, rows: int = 28, cols: int = 28) -> Self:
+        return cls(images=np.empty((0, rows, cols), dtype=np.uint8), labels=np.empty((0,), dtype=np.uint8))
 
     def extend(self, other_dataset: Self):
-        self.images.extend(other_dataset.images)
-        self.labels.extend(other_dataset.labels)
+        self.images = np.concatenate((self.images, other_dataset.images), axis=0)
+        self.labels = np.concatenate((self.labels, other_dataset.labels), axis=0)
 
 class MNIST:
     def download():
@@ -97,31 +111,24 @@ class MNIST:
             file.write(struct.pack(">IIII", 2051, images_size, rows, cols))
             file.write(image_data.tobytes())
 
-    def load():
-        labels, labels_size = MNIST.__load_labels(DATA_DIR_FORMATTED_LABELS)
+    def load() -> Dataset:
+        label_data, _ = MNIST.__load_labels(DATA_DIR_FORMATTED_LABELS)
         image_data, _, rows, cols = MNIST.__load_images(DATA_DIR_FORMATTED_IMAGES)
 
-        images = []
-        for _ in range(labels_size):
-            images.append([0] * rows * cols)
-        for i in range(labels_size):
-            img = np.array(image_data[i * rows * cols:(i + 1) * rows * cols])
-            img = img.reshape(28, 28)
-            images[i][:] = img            
-
-        assert len(images) == len(labels), f"Dataset sizes do not match: {len(images)} images != {len(labels)} labels"
-        return Dataset(images=images, labels=labels.tolist())
+        labels = np.frombuffer(label_data, dtype=np.uint8).copy()
+        images = np.frombuffer(image_data, dtype=np.uint8).reshape(-1, rows, cols).copy()
+        return Dataset(images=images, labels=labels)
 
 
-def Rotation(source_dataset: Dataset) -> Dataset: return Dataset([], [])
-def Translation(source_dataset: Dataset) -> Dataset: return Dataset([], [])
-def Brightness(source_dataset: Dataset) -> Dataset: return Dataset([], [])
+def Rotation(source_dataset: Dataset) -> Dataset: return Dataset.empty()
+def Translation(source_dataset: Dataset) -> Dataset: return Dataset.empty()
+def Brightness(source_dataset: Dataset) -> Dataset: return Dataset.empty()
 
 def get_dataset(*transformations):
     MNIST.download()
     MNIST.format()
     source_dataset = MNIST.load()
-    dest_dataset = Dataset([], [])
+    dest_dataset = Dataset.empty(*source_dataset.images.shape[1:])
     dest_dataset.extend(source_dataset)
 
     for transform in transformations:
