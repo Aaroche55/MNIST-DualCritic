@@ -39,11 +39,14 @@ def get_source(args) -> SourceDataset:
 def get_transforms(args) -> list[Transform]:
     """One transform per selected name and seed, using the CLI's parameter values."""
     names = list(TRANSFORMS) if "all" in args.transform else list(dict.fromkeys(args.transform))
-    return [
-        TRANSFORMS[name](seed=seed, **{f.name: getattr(args, f.name) for f in transform_params(TRANSFORMS[name])})
-        for name in names
-        for seed in dict.fromkeys(args.seed)
-    ]
+    try:
+        return [
+            TRANSFORMS[name](seed=seed, **{f.name: getattr(args, f.name) for f in transform_params(TRANSFORMS[name])})
+            for name in names
+            for seed in dict.fromkeys(args.seed)
+        ]
+    except ValueError as error:
+        raise SystemExit(f"Invalid transform parameters: {error}")
 
 
 def cmd_list(args):
@@ -129,7 +132,7 @@ def cmd_show(args):
     source = get_source(args)
     original = source.prepare()
     end = min(args.index + args.count, len(original))
-    if args.index >= end:
+    if args.index >= len(original):
         raise SystemExit(f"Index {args.index} is out of range for {len(original)} samples")
 
     # Show the cached outputs so the preview matches exactly what get_dataset returns
@@ -144,14 +147,26 @@ def cmd_show(args):
         print()
 
 
+def bounded_int(minimum: int):
+    def parse(value: str) -> int:
+        number = int(value)
+        if number < minimum:
+            raise argparse.ArgumentTypeError(f"must be at least {minimum}, got {number}")
+        return number
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data", description="Download, inspect and augment image datasets.")
-    parser.add_argument("-d", "--dataset", choices=DATASETS, default="mnist", help="source dataset (default: %(default)s)")
-    parser.add_argument("--data-dir", type=Path, default=Path("./data"), help="root data directory (default: %(default)s)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # Given to every subcommand so they can follow it, e.g. `data show -d mnist`
+    common_options = argparse.ArgumentParser(add_help=False)
+    common_options.add_argument("-d", "--dataset", choices=DATASETS, default="mnist", help="source dataset (default: %(default)s)")
+    common_options.add_argument("--data-dir", type=Path, default=Path("./data"), help="root data directory (default: %(default)s)")
+
     # Shared transform options, generated from each Transform's dataclass fields
-    transform_options = argparse.ArgumentParser(add_help=False)
+    transform_options = argparse.ArgumentParser(add_help=False, parents=[common_options])
     group = transform_options.add_argument_group("transforms")
     group.add_argument("-t", "--transform", action="append", default=[], choices=[*TRANSFORMS, "all"],
                        help="transform to apply; repeat for several, or use 'all'")
@@ -166,14 +181,14 @@ def build_parser() -> argparse.ArgumentParser:
             group.add_argument(f"--{f.name.replace('_', '-')}", type=f.type, default=f.default,
                                help=f"{name} parameter (default: %(default)s)")
 
-    sub = subparsers.add_parser("list", help="list datasets, transforms and cached transform outputs")
+    sub = subparsers.add_parser("list", parents=[common_options], help="list datasets, transforms and cached transform outputs")
     sub.set_defaults(func=cmd_list)
 
-    sub = subparsers.add_parser("download", help="download the raw dataset (skipped if the checksum matches)")
+    sub = subparsers.add_parser("download", parents=[common_options], help="download the raw dataset (skipped if the checksum matches)")
     sub.add_argument("-f", "--force", action="store_true", help="re-download even if the checksum matches")
     sub.set_defaults(func=cmd_download)
 
-    sub = subparsers.add_parser("format", help="merge the raw files into the formatted dataset")
+    sub = subparsers.add_parser("format", parents=[common_options], help="merge the raw files into the formatted dataset")
     sub.set_defaults(func=cmd_format)
 
     sub = subparsers.add_parser("generate", parents=[transform_options], help="generate and cache transform outputs")
@@ -190,8 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.set_defaults(func=cmd_info)
 
     sub = subparsers.add_parser("show", parents=[transform_options], help="preview samples as ASCII art")
-    sub.add_argument("-i", "--index", type=int, default=0, help="first sample to show (default: %(default)s)")
-    sub.add_argument("-n", "--count", type=int, default=1, help="number of samples to show (default: %(default)s)")
+    sub.add_argument("-i", "--index", type=bounded_int(0), default=0, help="first sample to show (default: %(default)s)")
+    sub.add_argument("-n", "--count", type=bounded_int(1), default=1, help="number of samples to show (default: %(default)s)")
     sub.set_defaults(func=cmd_show)
 
     return parser
