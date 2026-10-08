@@ -1,26 +1,52 @@
-import struct
 import io
+import struct
+from dataclasses import dataclass
+from hashlib import sha512
+from pathlib import Path
+from typing import ClassVar, Self
+from urllib.request import urlopen
+from zipfile import ZipFile
+
 import numpy as np
 from scipy import ndimage
-from array import array
-from dataclasses import dataclass
-from enum import Enum, member
-from pathlib import Path
-from zipfile import ZipFile
-from urllib.request import urlopen
-from hashlib import sha512
-from typing import Self
 
-DATASET_URL = "https://www.kaggle.com/api/v1/datasets/download/hojjatk/mnist-dataset"
-DATASET_SHA512 = "b3ec3381298ea83eb56e34fdf84e32b9c6758732707d53b560f23eed662b07f90f406bc1e818d4f66cd2948546c959da6ec2ada44d3d069d26a37bd973d40047"
-DATA_DIR = Path("./data")
-DATA_DIR_RAW = DATA_DIR / "raw"
-DATA_DIR_FORMATTED = DATA_DIR / "formatted"
-DATA_DIR_FORMATTED_LABELS = DATA_DIR_FORMATTED / "labels.idx1-ubyte"
-DATA_DIR_FORMATTED_IMAGES = DATA_DIR_FORMATTED / "images.idx3-ubyte"
+# IDX file format, shared by MNIST and EMNIST
+IDX_LABELS_MAGIC = 2049
+IDX_IMAGES_MAGIC = 2051
 
-# DATA_FORMATTED = DATA_DIR / "formatted"
-# DATA_TRANSLATIONS = DATA_DIR / "translations"
+
+def read_idx_labels(path: Path) -> np.ndarray:
+    with path.open('rb') as file:
+        magic, size = struct.unpack(">II", file.read(8))
+        if magic != IDX_LABELS_MAGIC:
+            raise ValueError(f"Magic number mismatch, expected {IDX_LABELS_MAGIC}, got {magic}")
+        labels = np.frombuffer(file.read(), dtype=np.uint8)
+    if len(labels) != size:
+        raise ValueError(f"{path}: header says {size} labels, found {len(labels)}")
+    return labels.copy()
+
+def read_idx_images(path: Path) -> np.ndarray:
+    with path.open('rb') as file:
+        magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
+        if magic != IDX_IMAGES_MAGIC:
+            raise ValueError(f"Magic number mismatch, expected {IDX_IMAGES_MAGIC}, got {magic}")
+        images = np.frombuffer(file.read(), dtype=np.uint8).reshape(-1, rows, cols)
+    if len(images) != size:
+        raise ValueError(f"{path}: header says {size} images, found {len(images)}")
+    return images.copy()
+
+def write_idx_labels(path: Path, labels: np.ndarray):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('wb') as file:
+        file.write(struct.pack(">II", IDX_LABELS_MAGIC, len(labels)))
+        file.write(labels.astype(np.uint8).tobytes())
+
+def write_idx_images(path: Path, images: np.ndarray):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('wb') as file:
+        file.write(struct.pack(">IIII", IDX_IMAGES_MAGIC, *images.shape))
+        file.write(images.astype(np.uint8).tobytes())
+
 
 @dataclass
 class Dataset:
@@ -45,137 +71,114 @@ class Dataset:
         self.images = np.concatenate((self.images, other_dataset.images), axis=0)
         self.labels = np.concatenate((self.labels, other_dataset.labels), axis=0)
 
-class MNIST:
-    def download():
-        if DATA_DIR_RAW.exists():
+
+class SourceDataset:
+    """A downloadable IDX dataset. Subclasses describe where it comes from and which raw files it contains."""
+
+    name: ClassVar[str]
+    url: ClassVar[str]
+    sha512: ClassVar[str]
+    # (images, labels) file pairs relative to the raw directory, merged in order by format()
+    raw_files: ClassVar[tuple[tuple[str, str], ...]]
+
+    def __init__(self, data_dir: Path = Path("./data")):
+        self.raw_dir = data_dir / self.name / "raw"
+        self.formatted_dir = data_dir / self.name / "formatted"
+        self.formatted_images = self.formatted_dir / "images.idx3-ubyte"
+        self.formatted_labels = self.formatted_dir / "labels.idx1-ubyte"
+
+    def download(self):
+        if self.raw_dir.exists():
             fileData = b""
-            for file in DATA_DIR_RAW.rglob("*"):
+            for file in self.raw_dir.rglob("*"):
                 if file.is_dir():
                     continue
                 fileData += file.read_bytes()
 
             chksum = sha512(fileData).hexdigest()
             print(f"SHA512 checksum is: {chksum}")
-            if chksum == DATASET_SHA512:
+            if chksum == self.sha512:
                 print("Checksum matched, skipping download.")
                 return
             else:
                 print("Checksum does not match, downloading dataset.")
 
-        with urlopen(DATASET_URL, timeout=30) as resp:
+        with urlopen(self.url, timeout=30) as resp:
             data = resp.read()
 
         with ZipFile(io.BytesIO(data)) as zf:
-            zf.extractall(DATA_DIR_RAW)
+            zf.extractall(self.raw_dir)
 
-    def __load_labels(path: Path):
-        with path.open('rb') as file:
-            magic, size = struct.unpack(">II", file.read(8))
-            if magic != 2049:
-                raise ValueError('Magic number mismatch, expected 2049, got {}'.format(magic))
-            labels = array("B", file.read())
-        return labels, size
+    def format(self):
+        images = np.concatenate([read_idx_images(self.raw_dir / images) for images, _ in self.raw_files])
+        labels = np.concatenate([read_idx_labels(self.raw_dir / labels) for _, labels in self.raw_files])
+        assert len(images) == len(labels), f"Dataset sizes do not match: {len(images)} images != {len(labels)} labels"
 
-    def __load_images(path: Path):
-        with path.open('rb') as file:
-            magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
-            if magic != 2051:
-                raise ValueError('Magic number mismatch, expected 2051, got {}'.format(magic))
-            image_data = array("B", file.read())
-        return image_data, size, rows, cols
+        write_idx_images(self.formatted_images, images)
+        write_idx_labels(self.formatted_labels, labels)
 
-    def format():
-        images_filepath_train = DATA_DIR_RAW / 'train-images-idx3-ubyte/train-images-idx3-ubyte'
-        labels_filepath_train = DATA_DIR_RAW / 'train-labels-idx1-ubyte/train-labels-idx1-ubyte'
-        images_filepath_test = DATA_DIR_RAW / 't10k-images-idx3-ubyte/t10k-images-idx3-ubyte'
-        labels_filepath_test = DATA_DIR_RAW / 't10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte'
-
-        labels = array("B")
-        labels_size = 0
-        for filepath in (labels_filepath_train, labels_filepath_test):
-            labels_loaded, size = MNIST.__load_labels(filepath)
-            labels.extend(labels_loaded)
-            labels_size += size
-
-        image_data = array("B")
-        images_size = 0
-        for filepath in (images_filepath_train, images_filepath_test):
-            images_loaded, size, rows, cols = MNIST.__load_images(filepath)
-            image_data.extend(images_loaded)
-            images_size += size
-
-        assert labels_size == images_size, f"Dataset sizes do not match: {images_size} images != {labels_size} labels"
-
-        DATA_DIR_FORMATTED_LABELS.parent.mkdir(exist_ok=True)
-        with DATA_DIR_FORMATTED_LABELS.open('wb') as file:
-            file.write(struct.pack(">II", 2049, len(labels)))
-            file.write(labels.tobytes())
-
-        DATA_DIR_FORMATTED_IMAGES.parent.mkdir(exist_ok=True)
-        with DATA_DIR_FORMATTED_IMAGES.open('wb') as file:
-            file.write(struct.pack(">IIII", 2051, images_size, rows, cols))
-            file.write(image_data.tobytes())
-
-    def load() -> Dataset:
-        label_data, _ = MNIST.__load_labels(DATA_DIR_FORMATTED_LABELS)
-        image_data, _, rows, cols = MNIST.__load_images(DATA_DIR_FORMATTED_IMAGES)
-
-        labels = np.frombuffer(label_data, dtype=np.uint8).copy()
-        images = np.frombuffer(image_data, dtype=np.uint8).reshape(-1, rows, cols).copy()
-        return Dataset(images=images, labels=labels)
+    def load(self) -> Dataset:
+        return Dataset(images=read_idx_images(self.formatted_images), labels=read_idx_labels(self.formatted_labels))
 
 
-ROTATION_MAX_DEGREES = 50.0
-ROTATION_STD_DEGREES = ROTATION_MAX_DEGREES / 3  # ~99.7% of draws fall within the limit before clipping
-TRANSLATION_STD_PIXELS = 2.0
-BRIGHTNESS_MIN_SCALE = 0.5
-BRIGHTNESS_MAX_SCALE = 1.5
+class MNIST(SourceDataset):
+    name = "mnist"
+    url = "https://www.kaggle.com/api/v1/datasets/download/hojjatk/mnist-dataset"
+    sha512 = "b3ec3381298ea83eb56e34fdf84e32b9c6758732707d53b560f23eed662b07f90f406bc1e818d4f66cd2948546c959da6ec2ada44d3d069d26a37bd973d40047"
+    raw_files = (
+        ("train-images-idx3-ubyte/train-images-idx3-ubyte", "train-labels-idx1-ubyte/train-labels-idx1-ubyte"),
+        ("t10k-images-idx3-ubyte/t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte"),
+    )
 
-_rng = np.random.default_rng()
 
-def Rotation(source_dataset: Dataset, rng: np.random.Generator = _rng) -> Dataset:
+def Rotation(source_dataset: Dataset, rng: np.random.Generator | None = None, max_degrees: float = 50.0) -> Dataset:
+    rng = rng or np.random.default_rng()
     n = len(source_dataset.images)
-    degrees = np.clip(rng.standard_normal(n) * ROTATION_STD_DEGREES, -ROTATION_MAX_DEGREES, ROTATION_MAX_DEGREES)
+    std_degrees = max_degrees / 3  # ~99.7% of draws fall within the limit before clipping
+    degrees = np.clip(rng.standard_normal(n) * std_degrees, -max_degrees, max_degrees)
     images = np.empty_like(source_dataset.images)
     for i, (image, angle) in enumerate(zip(source_dataset.images, degrees)):
         ndimage.rotate(image, angle, reshape=False, order=1, mode="constant", cval=0, output=images[i])
     return Dataset(images=images, labels=source_dataset.labels.copy())
 
-def Translation(source_dataset: Dataset, rng: np.random.Generator = _rng) -> Dataset:
+def Translation(source_dataset: Dataset, rng: np.random.Generator | None = None, std_pixels: float = 2.0) -> Dataset:
+    rng = rng or np.random.default_rng()
     n = len(source_dataset.images)
     # Whole-pixel shifts keep digits sharp; extreme draws may clip the digit at the border
-    offsets = np.rint(rng.standard_normal((n, 2)) * TRANSLATION_STD_PIXELS)
+    offsets = np.rint(rng.standard_normal((n, 2)) * std_pixels)
     images = np.empty_like(source_dataset.images)
     for i, (image, offset) in enumerate(zip(source_dataset.images, offsets)):
         ndimage.shift(image, offset, order=0, mode="constant", cval=0, output=images[i])
     return Dataset(images=images, labels=source_dataset.labels.copy())
 
-def Brightness(source_dataset: Dataset, rng: np.random.Generator = _rng) -> Dataset:
+def Brightness(source_dataset: Dataset, rng: np.random.Generator | None = None, min_scale: float = 0.5, max_scale: float = 1.5) -> Dataset:
+    rng = rng or np.random.default_rng()
     n = len(source_dataset.images)
-    scale = rng.uniform(BRIGHTNESS_MIN_SCALE, BRIGHTNESS_MAX_SCALE, size=(n, 1, 1))
+    scale = rng.uniform(min_scale, max_scale, size=(n, 1, 1))
     images = np.clip(np.rint(source_dataset.images * scale), 0, 255).astype(source_dataset.images.dtype)
     return Dataset(images=images, labels=source_dataset.labels.copy())
 
-def get_dataset(*transformations):
-    MNIST.download()
-    MNIST.format()
-    source_dataset = MNIST.load()
+def get_dataset(source: SourceDataset, *transformations):
+    source.download()
+    source.format()
+    source_dataset = source.load()
     dest_dataset = Dataset.empty(*source_dataset.images.shape[1:])
     dest_dataset.extend(source_dataset)
 
+    rng = np.random.default_rng()
     for transform in transformations:
-        dest_dataset.extend(transform(source_dataset))
+        dest_dataset.extend(transform(source_dataset, rng))
 
     return dest_dataset
 
 def main():
     # cli for interacting with datasets
-    # use argparse
-    # options to download/redownload the dataset
+    # use argparse
+    # options to download/redownload the dataset
     # generate different translations
     print("Hello, from data.")
-    
-    out = get_dataset(Rotation)
+
+    out = get_dataset(MNIST(), Rotation)
 
     for image_a, image_b in zip(out.images[80000:80010], out.images[10000:10010]):
         for image in (image_a, image_b):
