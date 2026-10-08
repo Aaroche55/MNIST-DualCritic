@@ -1,3 +1,52 @@
+"""Source datasets, augmentation transforms, and the on-disk cache that composes them.
+
+Library usage::
+
+    from mnist_dualcritic.data import MNIST, Brightness, Rotation, Translation, get_dataset
+
+    source = MNIST()  # files live under ./data/mnist/; MNIST(Path("elsewhere")) changes the root
+
+    # The original samples plus one augmented copy per transform, each generated and cached on first use
+    dataset = get_dataset(source, Rotation(), Translation(std_pixels=3), Brightness(seed=1))
+    dataset.images  # (N, 28, 28) uint8
+    dataset.labels  # (N,) uint8
+
+    # Different seeds give differently randomised copies of the same transform
+    rotations = get_dataset(source, *(Rotation(seed=s) for s in range(3)), include_original=False)
+
+    source.prepare()                # just the original data, downloading and formatting it if needed
+    source.transformed(Rotation())  # a single transform's output
+    source.cached_transforms()      # {key: metadata} for every cached output
+
+On disk, each dataset gets its own directory::
+
+    data/<dataset>/
+        raw/                       downloaded files, each verified by SHA-256
+        formatted/                 the train and test splits merged into one IDX image/label pair
+        transforms/<name>-<hash>/  one cached transform output: IDX images, labels and metadata.json
+
+Transforms are frozen dataclasses whose fields, including ``seed``, are their parameters. Each one is
+deterministic, so its output is cached under a key hashed from its name, ``version`` and parameters, and
+``metadata.json`` records exactly how that output was made. Bump ``version`` after changing a transform's
+algorithm so outputs cached by the old code are regenerated instead of reused.
+
+Adding a transform::
+
+    @dataclass(frozen=True)
+    class Invert(Transform):
+        name = "invert"        # registers it in TRANSFORMS, and so in the CLI's --transform choices
+        amount: float = 1.0    # each field is a parameter, part of the cache key, and a CLI flag (--amount)
+
+        def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
+            images = np.rint(np.abs(dataset.images - self.amount * 255)).astype(np.uint8)
+            return Dataset(images=images, labels=dataset.labels.copy())
+
+Adding a dataset means subclassing ``SourceDataset`` with ``name``, ``url``, ``raw_files`` and ``checksums``;
+override ``format()`` if the raw files need more than concatenating (EMNIST's images are stored transposed).
+
+For the command line, see ``mnist_dualcritic.cli``.
+"""
+
 import io
 import json
 import shutil

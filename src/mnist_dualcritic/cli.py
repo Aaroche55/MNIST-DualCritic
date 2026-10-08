@@ -1,3 +1,25 @@
+"""Command-line interface to ``mnist_dualcritic.data``, installed as the ``data`` command.
+
+Usage::
+
+    uv run data list                                  # datasets, transforms with their defaults, cached outputs
+    uv run data download                              # fetch the raw files (skipped if checksums match)
+    uv run data generate -t all                       # cache the rotation, translation and brightness outputs
+    uv run data generate -t rotation --max-degrees 30 --seed 0 1 2    # three differently rotated copies
+    uv run data info -t rotation -t brightness        # size and label balance of the composed dataset
+    uv run data show -i 0 -n 3 -t all                 # ASCII preview: each original beside its transforms
+    uv run data clean -t rotation --max-degrees 30 --seed 0 1 2       # delete those three cached outputs
+    uv run data clean                                 # delete every cached output
+
+Every command takes ``-d/--dataset`` and ``--data-dir``. Commands that work with transforms take ``-t`` (repeat
+it, or use ``all``), ``--seed`` (several seeds give several copies), and one flag per transform parameter, such
+as ``--max-degrees``. Those flags are generated from the ``Transform`` dataclasses, so a new transform shows up
+here without any CLI changes.
+
+Each command maps directly onto the library: ``data info -t rotation --seed 0 1`` describes
+``get_dataset(MNIST(), Rotation(seed=0), Rotation(seed=1))``.
+"""
+
 import argparse
 import shutil
 from dataclasses import fields
