@@ -1,0 +1,22 @@
+[project]
+name = "mnist-dualcritic"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Aaron Roche", email = "<>" },
+    { name = "Andrew Jaffrey", email = "<>" },
+    { name = "Cormac Shannon", email = "<>" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.6",
+]
+
+[project.scripts]
+mnist-dualcritic = "mnist_dualcritic:main"
+data = "mnist_dualcritic.data:main"
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
