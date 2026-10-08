@@ -1,7 +1,9 @@
 import io
+import json
 import struct
-from dataclasses import dataclass
-from hashlib import sha512
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
+from hashlib import sha256, sha512
 from pathlib import Path
 from typing import ClassVar, Self
 from urllib.request import urlopen
@@ -13,6 +15,11 @@ from scipy import ndimage
 # IDX file format, shared by MNIST and EMNIST
 IDX_LABELS_MAGIC = 2049
 IDX_IMAGES_MAGIC = 2051
+
+# Every stored dataset directory (formatted source or cached transform) uses these file names
+IMAGES_FILENAME = "images.idx3-ubyte"
+LABELS_FILENAME = "labels.idx1-ubyte"
+METADATA_FILENAME = "metadata.json"
 
 
 def read_idx_labels(path: Path) -> np.ndarray:
@@ -79,14 +86,47 @@ class Dataset:
             index = [index]  # keep the leading N axis so a single item is still a Dataset
         return Dataset(images=self.images[index], labels=self.labels[index])
 
-    def save(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, images=self.images, labels=self.labels)
+    def save(self, directory: Path):
+        write_idx_images(directory / IMAGES_FILENAME, self.images)
+        write_idx_labels(directory / LABELS_FILENAME, self.labels)
 
     @classmethod
-    def from_file(cls, path: Path) -> Self:
-        with np.load(path) as data:
-            return cls(images=data["images"], labels=data["labels"])
+    def from_directory(cls, directory: Path) -> Self:
+        return cls(images=read_idx_images(directory / IMAGES_FILENAME), labels=read_idx_labels(directory / LABELS_FILENAME))
+
+
+@dataclass(frozen=True)
+class Transform:
+    """A deterministic augmentation. Its fields are its parameters, and together they identify its cached output.
+
+    Bump `version` whenever the transform's algorithm changes so stale cached outputs are regenerated.
+    """
+
+    name: ClassVar[str]
+    version: ClassVar[int] = 1
+    seed: int = 0
+
+    def __post_init__(self):
+        # Normalise ints passed for float parameters so Rotation(max_degrees=50) and 50.0 share a cache entry
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if f.type is float and isinstance(value, int) and not isinstance(value, bool):
+                object.__setattr__(self, f.name, float(value))
+
+    def __call__(self, dataset: Dataset) -> Dataset:
+        return self.apply(dataset, np.random.default_rng(self.seed))
+
+    def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
+        raise NotImplementedError
+
+    @property
+    def params(self) -> dict:
+        return asdict(self)
+
+    @property
+    def key(self) -> str:
+        payload = json.dumps({"transform": self.name, "version": self.version, "params": self.params}, sort_keys=True)
+        return f"{self.name}-{sha256(payload.encode()).hexdigest()[:12]}"
 
 
 class SourceDataset:
@@ -101,8 +141,7 @@ class SourceDataset:
     def __init__(self, data_dir: Path = Path("./data")):
         self.raw_dir = data_dir / self.name / "raw"
         self.formatted_dir = data_dir / self.name / "formatted"
-        self.formatted_images = self.formatted_dir / "images.idx3-ubyte"
-        self.formatted_labels = self.formatted_dir / "labels.idx1-ubyte"
+        self.transforms_dir = data_dir / self.name / "transforms"
 
     def download(self, force: bool = False):
         if self.raw_dir.exists() and not force:
@@ -129,20 +168,50 @@ class SourceDataset:
     def format(self):
         images = np.concatenate([read_idx_images(self.raw_dir / images) for images, _ in self.raw_files])
         labels = np.concatenate([read_idx_labels(self.raw_dir / labels) for _, labels in self.raw_files])
-        assert len(images) == len(labels), f"Dataset sizes do not match: {len(images)} images != {len(labels)} labels"
-
-        write_idx_images(self.formatted_images, images)
-        write_idx_labels(self.formatted_labels, labels)
+        Dataset(images=images, labels=labels).save(self.formatted_dir)
 
     def load(self) -> Dataset:
-        return Dataset(images=read_idx_images(self.formatted_images), labels=read_idx_labels(self.formatted_labels))
+        return Dataset.from_directory(self.formatted_dir)
 
     def prepare(self, force_download: bool = False) -> Dataset:
         """Download and format if needed, then load."""
-        if force_download or not (self.formatted_images.exists() and self.formatted_labels.exists()):
+        formatted = (self.formatted_dir / IMAGES_FILENAME, self.formatted_dir / LABELS_FILENAME)
+        if force_download or not all(path.exists() for path in formatted):
             self.download(force=force_download)
             self.format()
         return self.load()
+
+    def is_cached(self, transform: Transform) -> bool:
+        # A directory without metadata is an interrupted run and is never treated as cached
+        return (self.transforms_dir / transform.key / METADATA_FILENAME).exists()
+
+    def transformed(self, transform: Transform, regenerate: bool = False) -> Dataset:
+        """Load the transform's cached output, generating and caching it first if needed."""
+        directory = self.transforms_dir / transform.key
+        if self.is_cached(transform) and not regenerate:
+            return Dataset.from_directory(directory)
+
+        dataset = transform(self.prepare())
+        dataset.save(directory)
+        metadata = {
+            "source": self.name,
+            "transform": transform.name,
+            "version": transform.version,
+            "params": transform.params,
+            "samples": len(dataset),
+            "image_shape": list(dataset.images.shape[1:]),
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        # Written last so is_cached() only sees complete outputs
+        (directory / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
+        return dataset
+
+    def cached_transforms(self) -> dict[str, dict]:
+        """Metadata for every cached transform output, keyed by directory name."""
+        return {
+            path.parent.name: json.loads(path.read_text())
+            for path in sorted(self.transforms_dir.glob(f"*/{METADATA_FILENAME}"))
+        }
 
 
 class MNIST(SourceDataset):
@@ -155,44 +224,53 @@ class MNIST(SourceDataset):
     )
 
 
-def Rotation(source_dataset: Dataset, rng: np.random.Generator | None = None, max_degrees: float = 50.0) -> Dataset:
-    rng = rng or np.random.default_rng()
-    n = len(source_dataset.images)
-    std_degrees = max_degrees / 3  # ~99.7% of draws fall within the limit before clipping
-    degrees = np.clip(rng.standard_normal(n) * std_degrees, -max_degrees, max_degrees)
-    images = np.empty_like(source_dataset.images)
-    for i, (image, angle) in enumerate(zip(source_dataset.images, degrees)):
-        ndimage.rotate(image, angle, reshape=False, order=1, mode="constant", cval=0, output=images[i])
-    return Dataset(images=images, labels=source_dataset.labels.copy())
+@dataclass(frozen=True)
+class Rotation(Transform):
+    name = "rotation"
+    max_degrees: float = 50.0
 
-def Translation(source_dataset: Dataset, rng: np.random.Generator | None = None, std_pixels: float = 2.0) -> Dataset:
-    rng = rng or np.random.default_rng()
-    n = len(source_dataset.images)
-    # Whole-pixel shifts keep digits sharp; extreme draws may clip the digit at the border
-    offsets = np.rint(rng.standard_normal((n, 2)) * std_pixels)
-    images = np.empty_like(source_dataset.images)
-    for i, (image, offset) in enumerate(zip(source_dataset.images, offsets)):
-        ndimage.shift(image, offset, order=0, mode="constant", cval=0, output=images[i])
-    return Dataset(images=images, labels=source_dataset.labels.copy())
+    def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
+        std_degrees = self.max_degrees / 3  # ~99.7% of draws fall within the limit before clipping
+        degrees = np.clip(rng.standard_normal(len(dataset)) * std_degrees, -self.max_degrees, self.max_degrees)
+        images = np.empty_like(dataset.images)
+        for i, (image, angle) in enumerate(zip(dataset.images, degrees)):
+            ndimage.rotate(image, angle, reshape=False, order=1, mode="constant", cval=0, output=images[i])
+        return Dataset(images=images, labels=dataset.labels.copy())
 
-def Brightness(source_dataset: Dataset, rng: np.random.Generator | None = None, min_scale: float = 0.5, max_scale: float = 1.5) -> Dataset:
-    rng = rng or np.random.default_rng()
-    n = len(source_dataset.images)
-    scale = rng.uniform(min_scale, max_scale, size=(n, 1, 1))
-    images = np.clip(np.rint(source_dataset.images * scale), 0, 255).astype(source_dataset.images.dtype)
-    return Dataset(images=images, labels=source_dataset.labels.copy())
+@dataclass(frozen=True)
+class Translation(Transform):
+    name = "translation"
+    std_pixels: float = 2.0
 
-# Lookup tables used by the CLI; subclasses of SourceDataset register themselves by name
+    def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
+        # Whole-pixel shifts keep digits sharp; extreme draws may clip the digit at the border
+        offsets = np.rint(rng.standard_normal((len(dataset), 2)) * self.std_pixels)
+        images = np.empty_like(dataset.images)
+        for i, (image, offset) in enumerate(zip(dataset.images, offsets)):
+            ndimage.shift(image, offset, order=0, mode="constant", cval=0, output=images[i])
+        return Dataset(images=images, labels=dataset.labels.copy())
+
+@dataclass(frozen=True)
+class Brightness(Transform):
+    name = "brightness"
+    min_scale: float = 0.5
+    max_scale: float = 1.5
+
+    def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
+        scale = rng.uniform(self.min_scale, self.max_scale, size=(len(dataset), 1, 1))
+        images = np.clip(np.rint(dataset.images * scale), 0, 255).astype(dataset.images.dtype)
+        return Dataset(images=images, labels=dataset.labels.copy())
+
+# Lookup tables used by the CLI; subclasses register themselves by name
 DATASETS: dict[str, type[SourceDataset]] = {cls.name: cls for cls in SourceDataset.__subclasses__()}
-TRANSFORMS = {"rotation": Rotation, "translation": Translation, "brightness": Brightness}
+TRANSFORMS: dict[str, type[Transform]] = {cls.name: cls for cls in Transform.__subclasses__()}
 
-def get_dataset(source: SourceDataset, *transformations, rng: np.random.Generator | None = None):
-    source_dataset = source.prepare()
-    dest_dataset = Dataset.empty(*source_dataset.images.shape[1:])
-    dest_dataset.extend(source_dataset)
-
-    rng = rng or np.random.default_rng()
-    for transform in transformations:
-        dest_dataset.extend(transform(source_dataset, rng))
-
-    return dest_dataset
+def get_dataset(source: SourceDataset, *transforms: Transform, include_original: bool = True) -> Dataset:
+    """Compose the source dataset with each transform's output, generating any that aren't cached yet."""
+    original = source.prepare()
+    dataset = Dataset.empty(*original.images.shape[1:])
+    if include_original:
+        dataset.extend(original)
+    for transform in transforms:
+        dataset.extend(source.transformed(transform))
+    return dataset
