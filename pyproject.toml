@@ -16,7 +16,7 @@ dependencies = [
 
 [project.scripts]
 mnist-dualcritic = "mnist_dualcritic:main"
-data = "mnist_dualcritic.data:main"
+data = "mnist_dualcritic.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.16,<0.13.0"]
