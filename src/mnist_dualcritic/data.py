@@ -71,6 +71,23 @@ class Dataset:
         self.images = np.concatenate((self.images, other_dataset.images), axis=0)
         self.labels = np.concatenate((self.labels, other_dataset.labels), axis=0)
 
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index) -> Self:
+        if isinstance(index, (int, np.integer)):
+            index = [index]  # keep the leading N axis so a single item is still a Dataset
+        return Dataset(images=self.images[index], labels=self.labels[index])
+
+    def save(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(path, images=self.images, labels=self.labels)
+
+    @classmethod
+    def from_file(cls, path: Path) -> Self:
+        with np.load(path) as data:
+            return cls(images=data["images"], labels=data["labels"])
+
 
 class SourceDataset:
     """A downloadable IDX dataset. Subclasses describe where it comes from and which raw files it contains."""
@@ -87,8 +104,8 @@ class SourceDataset:
         self.formatted_images = self.formatted_dir / "images.idx3-ubyte"
         self.formatted_labels = self.formatted_dir / "labels.idx1-ubyte"
 
-    def download(self):
-        if self.raw_dir.exists():
+    def download(self, force: bool = False):
+        if self.raw_dir.exists() and not force:
             fileData = b""
             for file in self.raw_dir.rglob("*"):
                 if file.is_dir():
@@ -119,6 +136,13 @@ class SourceDataset:
 
     def load(self) -> Dataset:
         return Dataset(images=read_idx_images(self.formatted_images), labels=read_idx_labels(self.formatted_labels))
+
+    def prepare(self, force_download: bool = False) -> Dataset:
+        """Download and format if needed, then load."""
+        if force_download or not (self.formatted_images.exists() and self.formatted_labels.exists()):
+            self.download(force=force_download)
+            self.format()
+        return self.load()
 
 
 class MNIST(SourceDataset):
@@ -158,34 +182,17 @@ def Brightness(source_dataset: Dataset, rng: np.random.Generator | None = None, 
     images = np.clip(np.rint(source_dataset.images * scale), 0, 255).astype(source_dataset.images.dtype)
     return Dataset(images=images, labels=source_dataset.labels.copy())
 
-def get_dataset(source: SourceDataset, *transformations):
-    source.download()
-    source.format()
-    source_dataset = source.load()
+# Lookup tables used by the CLI; subclasses of SourceDataset register themselves by name
+DATASETS: dict[str, type[SourceDataset]] = {cls.name: cls for cls in SourceDataset.__subclasses__()}
+TRANSFORMS = {"rotation": Rotation, "translation": Translation, "brightness": Brightness}
+
+def get_dataset(source: SourceDataset, *transformations, rng: np.random.Generator | None = None):
+    source_dataset = source.prepare()
     dest_dataset = Dataset.empty(*source_dataset.images.shape[1:])
     dest_dataset.extend(source_dataset)
 
-    rng = np.random.default_rng()
+    rng = rng or np.random.default_rng()
     for transform in transformations:
         dest_dataset.extend(transform(source_dataset, rng))
 
     return dest_dataset
-
-def main():
-    # cli for interacting with datasets
-    # use argparse
-    # options to download/redownload the dataset
-    # generate different translations
-    print("Hello, from data.")
-
-    out = get_dataset(MNIST(), Rotation)
-
-    for image_a, image_b in zip(out.images[80000:80010], out.images[10000:10010]):
-        for image in (image_a, image_b):
-            for x in image:
-                for y in x:
-                    print([' ','.','"','-','+','o','O','M','#','@'][int(y/256*10)], end="")
-                print()
-
-if __name__ == "__main__":
-    main()
