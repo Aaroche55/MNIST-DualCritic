@@ -53,6 +53,22 @@ class MNIST:
         with ZipFile(io.BytesIO(data)) as zf:
             zf.extractall(DATA_DIR_RAW)
 
+    def __load_labels(path: Path):
+        with path.open('rb') as file:
+            magic, size = struct.unpack(">II", file.read(8))
+            if magic != 2049:
+                raise ValueError('Magic number mismatch, expected 2049, got {}'.format(magic))
+            labels = array("B", file.read())
+        return labels, size
+
+    def __load_images(path: Path):
+        with path.open('rb') as file:
+            magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
+            if magic != 2051:
+                raise ValueError('Magic number mismatch, expected 2051, got {}'.format(magic))
+            image_data = array("B", file.read())
+        return image_data, size, rows, cols
+
     def format():
         images_filepath_train = DATA_DIR_RAW / 'train-images-idx3-ubyte/train-images-idx3-ubyte'
         labels_filepath_train = DATA_DIR_RAW / 'train-labels-idx1-ubyte/train-labels-idx1-ubyte'
@@ -61,20 +77,16 @@ class MNIST:
 
         labels = array("B")
         for filepath in (labels_filepath_train, labels_filepath_test):
-            with filepath.open('rb') as file:
-                magic, size = struct.unpack(">II", file.read(8))
-                if magic != 2049:
-                    raise ValueError('Magic number mismatch, expected 2049, got {}'.format(magic))
-                labels.extend(array("B", file.read()))
+            labels_loaded, labels_size = MNIST.__load_labels(filepath)
+            labels.extend(labels_loaded)
         
         image_data = array("B")
         for filepath in (images_filepath_train, images_filepath_test):
-            with filepath.open('rb') as file:
-                magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
-                if magic != 2051:
-                    raise ValueError('Magic number mismatch, expected 2051, got {}'.format(magic))
-                image_data.extend(array("B", file.read()))
-        
+            images_loaded, images_size, rows, cols = MNIST.__load_images(filepath)
+            image_data.extend(images_loaded)
+
+        assert labels_size == images_size, f"Dataset sizes do not match: {images_size} images != {labels_size} labels"
+
         DATA_DIR_FORMATTED_LABELS.parent.mkdir(exist_ok=True)
         with DATA_DIR_FORMATTED_LABELS.open('wb') as file:
             file.write(struct.pack(">II", 2049, len(labels)))
@@ -82,29 +94,22 @@ class MNIST:
 
         DATA_DIR_FORMATTED_IMAGES.parent.mkdir(exist_ok=True)
         with DATA_DIR_FORMATTED_IMAGES.open('wb') as file:
-            file.write(struct.pack(">IIII", 2051, size, rows, cols))
+            file.write(struct.pack(">IIII", 2051, images_size, rows, cols))
             file.write(image_data.tobytes())
 
     def load():
-        with DATA_DIR_FORMATTED_LABELS.open('rb') as file:
-            magic, size = struct.unpack(">II", file.read(8))
-            if magic != 2049:
-                raise ValueError('Magic number mismatch, expected 2049, got {}'.format(magic))
-            labels = array("B", file.read())
-        with DATA_DIR_FORMATTED_IMAGES.open('rb') as file:
-            magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
-            if magic != 2051:
-                raise ValueError('Magic number mismatch, expected 2051, got {}'.format(magic))
-            image_data = array("B", file.read())
+        labels, labels_size = MNIST.__load_labels(DATA_DIR_FORMATTED_LABELS)
+        image_data, _, rows, cols = MNIST.__load_images(DATA_DIR_FORMATTED_IMAGES)
 
         images = []
-        for _ in range(size):
+        for _ in range(labels_size):
             images.append([0] * rows * cols)
-        for i in range(size):
+        for i in range(labels_size):
             img = np.array(image_data[i * rows * cols:(i + 1) * rows * cols])
             img = img.reshape(28, 28)
             images[i][:] = img            
 
+        assert len(images) == len(labels), f"Dataset sizes do not match: {len(images)} images != {len(labels)} labels"
         return Dataset(images=images, labels=labels.tolist())
 
 
