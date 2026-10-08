@@ -1,6 +1,7 @@
 import struct
 import io
 import numpy as np
+from scipy import ndimage
 from array import array
 from dataclasses import dataclass
 from enum import Enum, member
@@ -124,9 +125,36 @@ class MNIST:
         return Dataset(images=images, labels=labels)
 
 
-def Rotation(source_dataset: Dataset) -> Dataset: return Dataset.empty()
-def Translation(source_dataset: Dataset) -> Dataset: return Dataset.empty()
-def Brightness(source_dataset: Dataset) -> Dataset: return Dataset.empty()
+ROTATION_MAX_DEGREES = 50.0
+ROTATION_STD_DEGREES = ROTATION_MAX_DEGREES / 3  # ~99.7% of draws fall within the limit before clipping
+TRANSLATION_STD_PIXELS = 2.0
+BRIGHTNESS_MIN_SCALE = 0.5
+BRIGHTNESS_MAX_SCALE = 1.5
+
+_rng = np.random.default_rng()
+
+def Rotation(source_dataset: Dataset, rng: np.random.Generator = _rng) -> Dataset:
+    n = len(source_dataset.images)
+    degrees = np.clip(rng.standard_normal(n) * ROTATION_STD_DEGREES, -ROTATION_MAX_DEGREES, ROTATION_MAX_DEGREES)
+    images = np.empty_like(source_dataset.images)
+    for i, (image, angle) in enumerate(zip(source_dataset.images, degrees)):
+        ndimage.rotate(image, angle, reshape=False, order=1, mode="constant", cval=0, output=images[i])
+    return Dataset(images=images, labels=source_dataset.labels.copy())
+
+def Translation(source_dataset: Dataset, rng: np.random.Generator = _rng) -> Dataset:
+    n = len(source_dataset.images)
+    # Whole-pixel shifts keep digits sharp; extreme draws may clip the digit at the border
+    offsets = np.rint(rng.standard_normal((n, 2)) * TRANSLATION_STD_PIXELS)
+    images = np.empty_like(source_dataset.images)
+    for i, (image, offset) in enumerate(zip(source_dataset.images, offsets)):
+        ndimage.shift(image, offset, order=0, mode="constant", cval=0, output=images[i])
+    return Dataset(images=images, labels=source_dataset.labels.copy())
+
+def Brightness(source_dataset: Dataset, rng: np.random.Generator = _rng) -> Dataset:
+    n = len(source_dataset.images)
+    scale = rng.uniform(BRIGHTNESS_MIN_SCALE, BRIGHTNESS_MAX_SCALE, size=(n, 1, 1))
+    images = np.clip(np.rint(source_dataset.images * scale), 0, 255).astype(source_dataset.images.dtype)
+    return Dataset(images=images, labels=source_dataset.labels.copy())
 
 def get_dataset(*transformations):
     MNIST.download()
@@ -149,12 +177,12 @@ def main():
     
     out = get_dataset(Rotation)
 
-    print(out.labels[:1000])
-    for image in out.images[:1]:
-        for x in image:
-            for y in x:
-                print([' ','.','"','-','+','o','O','M','#','@'][int(y/256*10)], end="")
-            print()
+    for image_a, image_b in zip(out.images[80000:80010], out.images[10000:10010]):
+        for image in (image_a, image_b):
+            for x in image:
+                for y in x:
+                    print([' ','.','"','-','+','o','O','M','#','@'][int(y/256*10)], end="")
+                print()
 
 if __name__ == "__main__":
     main()
