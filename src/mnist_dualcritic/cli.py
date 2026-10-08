@@ -7,20 +7,19 @@ import numpy as np
 
 from mnist_dualcritic.data import DATASETS, TRANSFORMS, Dataset, SourceDataset, Transform, get_dataset
 
-ASCII_RAMP = " .\"-+oOM#@"
+ASCII_RAMP = ' ."-+oOM#@'
 
 
 def render(images: list[np.ndarray], titles: list[str]) -> str:
     """Render images side by side as ASCII art."""
     gap = "  "
     width = images[0].shape[1]
-    lines = [gap.join(title[:width].ljust(width) for title in titles)]
-    for row in range(images[0].shape[0]):
-        lines.append(gap.join(
-            "".join(ASCII_RAMP[int(pixel) * len(ASCII_RAMP) // 256] for pixel in image[row])
-            for image in images
-        ))
-    return "\n".join(lines)
+    header = gap.join(title[:width].ljust(width) for title in titles)
+    rows = [
+        gap.join("".join(ASCII_RAMP[int(pixel) * len(ASCII_RAMP) // 256] for pixel in image[row]) for image in images)
+        for row in range(images[0].shape[0])
+    ]
+    return "\n".join([header, *rows])
 
 
 def format_params(params: dict) -> str:
@@ -46,7 +45,7 @@ def get_transforms(args) -> list[Transform]:
             for seed in dict.fromkeys(args.seed)
         ]
     except ValueError as error:
-        raise SystemExit(f"Invalid transform parameters: {error}")
+        raise SystemExit(f"Invalid transform parameters: {error}") from None
 
 
 def cmd_list(args):
@@ -124,7 +123,7 @@ def cmd_info(args):
     print(f"Pixels:   min {dataset.images.min()}, max {dataset.images.max()}, mean {dataset.images.mean():.2f}")
     print("Labels:")
     values, counts = np.unique(dataset.labels, return_counts=True)
-    for value, count in zip(values, counts):
+    for value, count in zip(values, counts, strict=True):
         print(f"  {value:>3}: {count:>6} ({count / len(dataset):.1%})")
 
 
@@ -153,6 +152,7 @@ def bounded_int(minimum: int):
         if number < minimum:
             raise argparse.ArgumentTypeError(f"must be at least {minimum}, got {number}")
         return number
+
     return parse
 
 
@@ -162,51 +162,84 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Given to every subcommand so they can follow it, e.g. `data show -d mnist`
     common_options = argparse.ArgumentParser(add_help=False)
-    common_options.add_argument("-d", "--dataset", choices=DATASETS, default="mnist", help="source dataset (default: %(default)s)")
-    common_options.add_argument("--data-dir", type=Path, default=Path("./data"), help="root data directory (default: %(default)s)")
+    common_options.add_argument(
+        "-d", "--dataset", choices=DATASETS, default="mnist", help="source dataset (default: %(default)s)"
+    )
+    common_options.add_argument(
+        "--data-dir", type=Path, default=Path("./data"), help="root data directory (default: %(default)s)"
+    )
 
     # Shared transform options, generated from each Transform's dataclass fields
     transform_options = argparse.ArgumentParser(add_help=False, parents=[common_options])
     group = transform_options.add_argument_group("transforms")
-    group.add_argument("-t", "--transform", action="append", default=[], choices=[*TRANSFORMS, "all"],
-                       help="transform to apply; repeat for several, or use 'all'")
-    group.add_argument("--seed", type=int, nargs="+", default=[0],
-                       help="seed(s) for each transform; several seeds give several augmented copies (default: 0)")
+    group.add_argument(
+        "-t",
+        "--transform",
+        action="append",
+        default=[],
+        choices=[*TRANSFORMS, "all"],
+        help="transform to apply; repeat for several, or use 'all'",
+    )
+    group.add_argument(
+        "--seed",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="seed(s) for each transform; several seeds give several augmented copies (default: 0)",
+    )
     owners: dict[str, str] = {}
     for name, cls in TRANSFORMS.items():
         for f in transform_params(cls):
             if f.name in owners:
                 raise ValueError(f"Transforms {owners[f.name]} and {name} both have a parameter named {f.name!r}")
             owners[f.name] = name
-            group.add_argument(f"--{f.name.replace('_', '-')}", type=f.type, default=f.default,
-                               help=f"{name} parameter (default: %(default)s)")
+            group.add_argument(
+                f"--{f.name.replace('_', '-')}",
+                type=f.type,
+                default=f.default,
+                help=f"{name} parameter (default: %(default)s)",
+            )
 
-    sub = subparsers.add_parser("list", parents=[common_options], help="list datasets, transforms and cached transform outputs")
+    sub = subparsers.add_parser(
+        "list", parents=[common_options], help="list datasets, transforms and cached transform outputs"
+    )
     sub.set_defaults(func=cmd_list)
 
-    sub = subparsers.add_parser("download", parents=[common_options], help="download the raw dataset (skipped if the checksum matches)")
+    sub = subparsers.add_parser(
+        "download", parents=[common_options], help="download the raw dataset (skipped if the checksum matches)"
+    )
     sub.add_argument("-f", "--force", action="store_true", help="re-download even if the checksum matches")
     sub.set_defaults(func=cmd_download)
 
-    sub = subparsers.add_parser("format", parents=[common_options], help="merge the raw files into the formatted dataset")
+    sub = subparsers.add_parser(
+        "format", parents=[common_options], help="merge the raw files into the formatted dataset"
+    )
     sub.set_defaults(func=cmd_format)
 
     sub = subparsers.add_parser("generate", parents=[transform_options], help="generate and cache transform outputs")
     sub.add_argument("-f", "--force", action="store_true", help="regenerate even if already cached")
     sub.set_defaults(func=cmd_generate)
 
-    sub = subparsers.add_parser("clean", parents=[transform_options],
-                                help="delete cached transform outputs (all of them unless --transform is given)")
+    sub = subparsers.add_parser(
+        "clean",
+        parents=[transform_options],
+        help="delete cached transform outputs (all of them unless --transform is given)",
+    )
     sub.set_defaults(func=cmd_clean)
 
-    sub = subparsers.add_parser("info", parents=[transform_options],
-                                help="print size, image shape and label distribution of a composed dataset")
+    sub = subparsers.add_parser(
+        "info", parents=[transform_options], help="print size, image shape and label distribution of a composed dataset"
+    )
     sub.add_argument("--no-original", action="store_true", help="exclude the untransformed samples")
     sub.set_defaults(func=cmd_info)
 
     sub = subparsers.add_parser("show", parents=[transform_options], help="preview samples as ASCII art")
-    sub.add_argument("-i", "--index", type=bounded_int(0), default=0, help="first sample to show (default: %(default)s)")
-    sub.add_argument("-n", "--count", type=bounded_int(1), default=1, help="number of samples to show (default: %(default)s)")
+    sub.add_argument(
+        "-i", "--index", type=bounded_int(0), default=0, help="first sample to show (default: %(default)s)"
+    )
+    sub.add_argument(
+        "-n", "--count", type=bounded_int(1), default=1, help="number of samples to show (default: %(default)s)"
+    )
     sub.set_defaults(func=cmd_show)
 
     return parser

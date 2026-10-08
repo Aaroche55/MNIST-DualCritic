@@ -3,7 +3,7 @@ import json
 import shutil
 import struct
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from pathlib import Path
 from typing import ClassVar, Self
@@ -27,6 +27,7 @@ PARTIAL_SUFFIX = ".partial"
 DATASETS: dict[str, type["SourceDataset"]] = {}
 TRANSFORMS: dict[str, type["Transform"]] = {}
 
+
 def _register(registry: dict[str, type], cls: type):
     if "name" not in cls.__dict__:
         return  # intermediate base classes without their own name aren't selectable
@@ -35,42 +36,50 @@ def _register(registry: dict[str, type], cls: type):
     registry[cls.name] = cls
 
 
+def _read_idx(path: Path, magic: int, ndim: int, kind: str) -> np.ndarray:
+    """Read an unsigned-byte IDX file with `ndim` dimensions, validating it against its header."""
+    header_size = 4 * (1 + ndim)
+    with path.open("rb") as file:
+        header = file.read(header_size)
+        if len(header) != header_size:
+            raise ValueError(f"{path}: file is too short to contain an IDX header")
+        found_magic, *shape = struct.unpack(f">{1 + ndim}I", header)
+        if found_magic != magic:
+            raise ValueError(f"{path}: Magic number mismatch, expected {magic}, got {found_magic}")
+        body = file.read()
+    item_size = int(np.prod(shape[1:]))
+    if len(body) != shape[0] * item_size:
+        raise ValueError(f"{path}: header says {shape[0]} {kind}, found {len(body) / item_size:g}")
+    # Copy so callers get a writable array rather than a read-only view of the bytes
+    return np.frombuffer(body, dtype=np.uint8).reshape(shape).copy()
+
+
 def read_idx_labels(path: Path) -> np.ndarray:
-    with path.open('rb') as file:
-        magic, size = struct.unpack(">II", file.read(8))
-        if magic != IDX_LABELS_MAGIC:
-            raise ValueError(f"Magic number mismatch, expected {IDX_LABELS_MAGIC}, got {magic}")
-        labels = np.frombuffer(file.read(), dtype=np.uint8)
-    if len(labels) != size:
-        raise ValueError(f"{path}: header says {size} labels, found {len(labels)}")
-    return labels.copy()
+    return _read_idx(path, IDX_LABELS_MAGIC, ndim=1, kind="labels")
+
 
 def read_idx_images(path: Path) -> np.ndarray:
-    with path.open('rb') as file:
-        magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
-        if magic != IDX_IMAGES_MAGIC:
-            raise ValueError(f"Magic number mismatch, expected {IDX_IMAGES_MAGIC}, got {magic}")
-        images = np.frombuffer(file.read(), dtype=np.uint8).reshape(-1, rows, cols)
-    if len(images) != size:
-        raise ValueError(f"{path}: header says {size} images, found {len(images)}")
-    return images.copy()
+    return _read_idx(path, IDX_IMAGES_MAGIC, ndim=3, kind="images")
+
 
 def _require_uint8(name: str, array: np.ndarray):
     # Casting would silently wrap out-of-range values (e.g. 300 -> 44), so make callers convert explicitly
     if array.dtype != np.uint8:
         raise TypeError(f"{name} must be uint8 to write as IDX, got {array.dtype}")
 
+
 def write_idx_labels(path: Path, labels: np.ndarray):
     _require_uint8("labels", labels)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('wb') as file:
+    with path.open("wb") as file:
         file.write(struct.pack(">II", IDX_LABELS_MAGIC, len(labels)))
         file.write(labels.tobytes())
+
 
 def write_idx_images(path: Path, images: np.ndarray):
     _require_uint8("images", images)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('wb') as file:
+    with path.open("wb") as file:
         file.write(struct.pack(">IIII", IDX_IMAGES_MAGIC, *images.shape))
         file.write(images.tobytes())
 
@@ -97,7 +106,9 @@ class Dataset:
     @classmethod
     def concatenate(cls, datasets: list[Self]) -> Self:
         """Join datasets in one copy (repeated extend() re-copies everything joined so far)."""
-        return cls(images=np.concatenate([d.images for d in datasets]), labels=np.concatenate([d.labels for d in datasets]))
+        return cls(
+            images=np.concatenate([d.images for d in datasets]), labels=np.concatenate([d.labels for d in datasets])
+        )
 
     def extend(self, other_dataset: Self):
         self.images = np.concatenate((self.images, other_dataset.images), axis=0)
@@ -117,7 +128,9 @@ class Dataset:
 
     @classmethod
     def from_directory(cls, directory: Path) -> Self:
-        return cls(images=read_idx_images(directory / IMAGES_FILENAME), labels=read_idx_labels(directory / LABELS_FILENAME))
+        return cls(
+            images=read_idx_images(directory / IMAGES_FILENAME), labels=read_idx_labels(directory / LABELS_FILENAME)
+        )
 
 
 @dataclass(frozen=True)
@@ -242,7 +255,7 @@ class SourceDataset:
             "params": transform.params,
             "samples": len(dataset),
             "image_shape": list(dataset.images.shape[1:]),
-            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "created": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         # Build the output beside the cache and swap it in, so an interrupted run never leaves a
         # directory that looks complete (e.g. old metadata next to half-written images)
@@ -270,7 +283,7 @@ class MNIST(SourceDataset):
         ("train-images-idx3-ubyte/train-images-idx3-ubyte", "train-labels-idx1-ubyte/train-labels-idx1-ubyte"),
         ("t10k-images-idx3-ubyte/t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte"),
     )
-    checksums = {
+    checksums: ClassVar[dict[str, str]] = {
         "train-images-idx3-ubyte/train-images-idx3-ubyte": "ba891046e6505d7aadcbbe25680a0738ad16aec93bde7f9b65e87a2fc25776db",
         "train-labels-idx1-ubyte/train-labels-idx1-ubyte": "65a50cbbf4e906d70832878ad85ccda5333a97f0f4c3dd2ef09a8a9eef7101c5",
         "t10k-images-idx3-ubyte/t10k-images-idx3-ubyte": "0fa7898d509279e482958e8ce81c8e77db3f2f8254e26661ceb7762c4d494ce7",
@@ -292,9 +305,10 @@ class Rotation(Transform):
         std_degrees = self.max_degrees / 3  # ~99.7% of draws fall within the limit before clipping
         degrees = np.clip(rng.standard_normal(len(dataset)) * std_degrees, -self.max_degrees, self.max_degrees)
         images = np.empty_like(dataset.images)
-        for i, (image, angle) in enumerate(zip(dataset.images, degrees)):
+        for i, (image, angle) in enumerate(zip(dataset.images, degrees, strict=True)):
             ndimage.rotate(image, angle, reshape=False, order=1, mode="constant", cval=0, output=images[i])
         return Dataset(images=images, labels=dataset.labels.copy())
+
 
 @dataclass(frozen=True)
 class Translation(Transform):
@@ -310,9 +324,10 @@ class Translation(Transform):
         # Whole-pixel shifts keep digits sharp; extreme draws may clip the digit at the border
         offsets = np.rint(rng.standard_normal((len(dataset), 2)) * self.std_pixels)
         images = np.empty_like(dataset.images)
-        for i, (image, offset) in enumerate(zip(dataset.images, offsets)):
+        for i, (image, offset) in enumerate(zip(dataset.images, offsets, strict=True)):
             ndimage.shift(image, offset, order=0, mode="constant", cval=0, output=images[i])
         return Dataset(images=images, labels=dataset.labels.copy())
+
 
 @dataclass(frozen=True)
 class Brightness(Transform):
@@ -329,6 +344,7 @@ class Brightness(Transform):
         scale = rng.uniform(self.min_scale, self.max_scale, size=(len(dataset), 1, 1))
         images = np.clip(np.rint(dataset.images * scale), 0, 255).astype(dataset.images.dtype)
         return Dataset(images=images, labels=dataset.labels.copy())
+
 
 def get_dataset(source: SourceDataset, *transforms: Transform, include_original: bool = True) -> Dataset:
     """Compose the source dataset with each transform's output, generating any that aren't cached yet."""
