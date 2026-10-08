@@ -1,9 +1,10 @@
 import io
 import json
+import shutil
 import struct
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
-from hashlib import sha256, sha512
+from hashlib import file_digest, sha256
 from pathlib import Path
 from typing import ClassVar, Self
 from urllib.request import urlopen
@@ -20,6 +21,18 @@ IDX_IMAGES_MAGIC = 2051
 IMAGES_FILENAME = "images.idx3-ubyte"
 LABELS_FILENAME = "labels.idx1-ubyte"
 METADATA_FILENAME = "metadata.json"
+PARTIAL_SUFFIX = ".partial"
+
+# Name -> class lookups used by the CLI; each subclass registers itself when defined, wherever it lives
+DATASETS: dict[str, type["SourceDataset"]] = {}
+TRANSFORMS: dict[str, type["Transform"]] = {}
+
+def _register(registry: dict[str, type], cls: type):
+    if "name" not in cls.__dict__:
+        return  # intermediate base classes without their own name aren't selectable
+    if cls.name in registry:
+        raise ValueError(f"{cls.name!r} is already registered by {registry[cls.name].__qualname__}")
+    registry[cls.name] = cls
 
 
 def read_idx_labels(path: Path) -> np.ndarray:
@@ -42,17 +55,24 @@ def read_idx_images(path: Path) -> np.ndarray:
         raise ValueError(f"{path}: header says {size} images, found {len(images)}")
     return images.copy()
 
+def _require_uint8(name: str, array: np.ndarray):
+    # Casting would silently wrap out-of-range values (e.g. 300 -> 44), so make callers convert explicitly
+    if array.dtype != np.uint8:
+        raise TypeError(f"{name} must be uint8 to write as IDX, got {array.dtype}")
+
 def write_idx_labels(path: Path, labels: np.ndarray):
+    _require_uint8("labels", labels)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('wb') as file:
         file.write(struct.pack(">II", IDX_LABELS_MAGIC, len(labels)))
-        file.write(labels.astype(np.uint8).tobytes())
+        file.write(labels.tobytes())
 
 def write_idx_images(path: Path, images: np.ndarray):
+    _require_uint8("images", images)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('wb') as file:
         file.write(struct.pack(">IIII", IDX_IMAGES_MAGIC, *images.shape))
-        file.write(images.astype(np.uint8).tobytes())
+        file.write(images.tobytes())
 
 
 @dataclass
@@ -73,6 +93,11 @@ class Dataset:
     @classmethod
     def empty(cls, rows: int = 28, cols: int = 28) -> Self:
         return cls(images=np.empty((0, rows, cols), dtype=np.uint8), labels=np.empty((0,), dtype=np.uint8))
+
+    @classmethod
+    def concatenate(cls, datasets: list[Self]) -> Self:
+        """Join datasets in one copy (repeated extend() re-copies everything joined so far)."""
+        return cls(images=np.concatenate([d.images for d in datasets]), labels=np.concatenate([d.labels for d in datasets]))
 
     def extend(self, other_dataset: Self):
         self.images = np.concatenate((self.images, other_dataset.images), axis=0)
@@ -106,11 +131,15 @@ class Transform:
     version: ClassVar[int] = 1
     seed: int = 0
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _register(TRANSFORMS, cls)
+
     def __post_init__(self):
         # Normalise ints passed for float parameters so Rotation(max_degrees=50) and 50.0 share a cache entry
         for f in fields(self):
             value = getattr(self, f.name)
-            if f.type is float and isinstance(value, int) and not isinstance(value, bool):
+            if f.type in (float, "float") and isinstance(value, int) and not isinstance(value, bool):
                 object.__setattr__(self, f.name, float(value))
 
     def __call__(self, dataset: Dataset) -> Dataset:
@@ -134,36 +163,49 @@ class SourceDataset:
 
     name: ClassVar[str]
     url: ClassVar[str]
-    sha512: ClassVar[str]
     # (images, labels) file pairs relative to the raw directory, merged in order by format()
     raw_files: ClassVar[tuple[tuple[str, str], ...]]
+    # SHA-256 of every file in raw_files, so verification ignores unrelated files in the raw directory
+    checksums: ClassVar[dict[str, str]]
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _register(DATASETS, cls)
 
     def __init__(self, data_dir: Path = Path("./data")):
         self.raw_dir = data_dir / self.name / "raw"
         self.formatted_dir = data_dir / self.name / "formatted"
         self.transforms_dir = data_dir / self.name / "transforms"
 
-    def download(self, force: bool = False):
-        if self.raw_dir.exists() and not force:
-            fileData = b""
-            for file in self.raw_dir.rglob("*"):
-                if file.is_dir():
-                    continue
-                fileData += file.read_bytes()
+    def invalid_raw_files(self) -> list[str]:
+        """Raw files that are missing or don't match their expected checksum."""
+        invalid = []
+        for relative_path, expected in self.checksums.items():
+            path = self.raw_dir / relative_path
+            if not path.is_file():
+                invalid.append(relative_path)
+                continue
+            with path.open("rb") as file:
+                if file_digest(file, "sha256").hexdigest() != expected:
+                    invalid.append(relative_path)
+        return invalid
 
-            chksum = sha512(fileData).hexdigest()
-            print(f"SHA512 checksum is: {chksum}")
-            if chksum == self.sha512:
-                print("Checksum matched, skipping download.")
+    def download(self, force: bool = False):
+        if not force:
+            invalid = self.invalid_raw_files()
+            if not invalid:
+                print("Raw files present and checksums match, skipping download.")
                 return
-            else:
-                print("Checksum does not match, downloading dataset.")
+            print(f"Missing or mismatched raw files ({', '.join(invalid)}), downloading dataset.")
 
         with urlopen(self.url, timeout=30) as resp:
             data = resp.read()
 
         with ZipFile(io.BytesIO(data)) as zf:
             zf.extractall(self.raw_dir)
+
+        if invalid := self.invalid_raw_files():
+            raise RuntimeError(f"Downloaded {self.name} files failed checksum verification: {', '.join(invalid)}")
 
     def format(self):
         images = np.concatenate([read_idx_images(self.raw_dir / images) for images, _ in self.raw_files])
@@ -192,8 +234,8 @@ class SourceDataset:
             return Dataset.from_directory(directory)
 
         dataset = transform(self.prepare())
-        dataset.save(directory)
         metadata = {
+            "key": transform.key,
             "source": self.name,
             "transform": transform.name,
             "version": transform.version,
@@ -202,8 +244,14 @@ class SourceDataset:
             "image_shape": list(dataset.images.shape[1:]),
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        # Written last so is_cached() only sees complete outputs
-        (directory / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
+        # Build the output beside the cache and swap it in, so an interrupted run never leaves a
+        # directory that looks complete (e.g. old metadata next to half-written images)
+        partial = directory.with_name(directory.name + PARTIAL_SUFFIX)
+        shutil.rmtree(partial, ignore_errors=True)
+        dataset.save(partial)
+        (partial / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
+        shutil.rmtree(directory, ignore_errors=True)
+        partial.rename(directory)
         return dataset
 
     def cached_transforms(self) -> dict[str, dict]:
@@ -211,23 +259,34 @@ class SourceDataset:
         return {
             path.parent.name: json.loads(path.read_text())
             for path in sorted(self.transforms_dir.glob(f"*/{METADATA_FILENAME}"))
+            if not path.parent.name.endswith(PARTIAL_SUFFIX)
         }
 
 
 class MNIST(SourceDataset):
     name = "mnist"
     url = "https://www.kaggle.com/api/v1/datasets/download/hojjatk/mnist-dataset"
-    sha512 = "b3ec3381298ea83eb56e34fdf84e32b9c6758732707d53b560f23eed662b07f90f406bc1e818d4f66cd2948546c959da6ec2ada44d3d069d26a37bd973d40047"
     raw_files = (
         ("train-images-idx3-ubyte/train-images-idx3-ubyte", "train-labels-idx1-ubyte/train-labels-idx1-ubyte"),
         ("t10k-images-idx3-ubyte/t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte"),
     )
+    checksums = {
+        "train-images-idx3-ubyte/train-images-idx3-ubyte": "ba891046e6505d7aadcbbe25680a0738ad16aec93bde7f9b65e87a2fc25776db",
+        "train-labels-idx1-ubyte/train-labels-idx1-ubyte": "65a50cbbf4e906d70832878ad85ccda5333a97f0f4c3dd2ef09a8a9eef7101c5",
+        "t10k-images-idx3-ubyte/t10k-images-idx3-ubyte": "0fa7898d509279e482958e8ce81c8e77db3f2f8254e26661ceb7762c4d494ce7",
+        "t10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte": "ff7bcfd416de33731a308c3f266cc351222c34898ecbeaf847f06e48f7ec33f2",
+    }
 
 
 @dataclass(frozen=True)
 class Rotation(Transform):
     name = "rotation"
     max_degrees: float = 50.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not 0 <= self.max_degrees <= 180:
+            raise ValueError(f"max_degrees must be between 0 and 180, got {self.max_degrees}")
 
     def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
         std_degrees = self.max_degrees / 3  # ~99.7% of draws fall within the limit before clipping
@@ -241,6 +300,11 @@ class Rotation(Transform):
 class Translation(Transform):
     name = "translation"
     std_pixels: float = 2.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.std_pixels < 0:
+            raise ValueError(f"std_pixels must be non-negative, got {self.std_pixels}")
 
     def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
         # Whole-pixel shifts keep digits sharp; extreme draws may clip the digit at the border
@@ -256,21 +320,21 @@ class Brightness(Transform):
     min_scale: float = 0.5
     max_scale: float = 1.5
 
+    def __post_init__(self):
+        super().__post_init__()
+        if not 0 <= self.min_scale <= self.max_scale:
+            raise ValueError(f"Need 0 <= min_scale <= max_scale, got {self.min_scale} and {self.max_scale}")
+
     def apply(self, dataset: Dataset, rng: np.random.Generator) -> Dataset:
         scale = rng.uniform(self.min_scale, self.max_scale, size=(len(dataset), 1, 1))
         images = np.clip(np.rint(dataset.images * scale), 0, 255).astype(dataset.images.dtype)
         return Dataset(images=images, labels=dataset.labels.copy())
 
-# Lookup tables used by the CLI; subclasses register themselves by name
-DATASETS: dict[str, type[SourceDataset]] = {cls.name: cls for cls in SourceDataset.__subclasses__()}
-TRANSFORMS: dict[str, type[Transform]] = {cls.name: cls for cls in Transform.__subclasses__()}
-
 def get_dataset(source: SourceDataset, *transforms: Transform, include_original: bool = True) -> Dataset:
     """Compose the source dataset with each transform's output, generating any that aren't cached yet."""
     original = source.prepare()
-    dataset = Dataset.empty(*original.images.shape[1:])
-    if include_original:
-        dataset.extend(original)
-    for transform in transforms:
-        dataset.extend(source.transformed(transform))
-    return dataset
+    parts = [original] if include_original else []
+    parts += [source.transformed(transform) for transform in transforms]
+    if not parts:
+        return Dataset.empty(*original.images.shape[1:])
+    return Dataset.concatenate(parts)
