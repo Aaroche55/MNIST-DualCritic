@@ -90,14 +90,18 @@ class MNIST:
         labels_filepath_test = DATA_DIR_RAW / 't10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte'
 
         labels = array("B")
+        labels_size = 0
         for filepath in (labels_filepath_train, labels_filepath_test):
-            labels_loaded, labels_size = MNIST.__load_labels(filepath)
+            labels_loaded, size = MNIST.__load_labels(filepath)
             labels.extend(labels_loaded)
-        
+            labels_size += size
+
         image_data = array("B")
+        images_size = 0
         for filepath in (images_filepath_train, images_filepath_test):
-            images_loaded, images_size, rows, cols = MNIST.__load_images(filepath)
+            images_loaded, size, rows, cols = MNIST.__load_images(filepath)
             image_data.extend(images_loaded)
+            images_size += size
 
         assert labels_size == images_size, f"Dataset sizes do not match: {images_size} images != {labels_size} labels"
 
