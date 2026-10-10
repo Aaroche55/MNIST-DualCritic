@@ -10,8 +10,7 @@ and MLX NN only, trained from random initialisation, and sized for an M4 Mac wit
 | `training.py` | Data loading, training loop, validation loss, checkpoint save and load, CLI |
 | `sample.py` | Generate a PNG grid of one digit from a checkpoint, CLI |
 
-MLX is not yet a project dependency, so the commands below use `uv run --with mlx`. Once it is added with
-`uv add mlx`, plain `uv run` works.
+MLX is a project dependency, so `uv sync` installs it.
 
 ## Model
 
@@ -81,8 +80,8 @@ hyperparameter tuning or looking at samples. `training.load_split("test")` raise
 ## Training
 
 ```sh
-uv run --with mlx python -m generator.training --epochs 20 --run-name ddpm
-uv run --with mlx python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30   # continue to epoch 30
+uv run python -m generator.training --epochs 20 --run-name ddpm
+uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30   # continue to epoch 30
 ```
 
 Other options: `--batch-size` (128), `--lr` (2e-4, Adam), `--seed` (0), `--base-channels` (32), `--timesteps`
@@ -122,7 +121,7 @@ outputs/
 ## Sampling
 
 ```sh
-uv run --with mlx python -m generator.sample --checkpoint outputs/checkpoints/ddpm/best --digit 7 --count 16 --seed 0
+uv run python -m generator.sample --checkpoint outputs/checkpoints/ddpm/best --digit 7 --count 16 --seed 0
 # -> outputs/generated/ddpm-best_digit7_n16_seed0.png
 ```
 
@@ -140,7 +139,7 @@ than one training step.
 ## Tests
 
 ```sh
-uv run --with mlx pytest tests/test_generator_smoke.py
+uv run pytest tests/test_generator_smoke.py
 ```
 
-The tests use only small random arrays and never read or download MNIST. Without MLX installed they are skipped.
+The tests use only small random arrays and never read or download MNIST.

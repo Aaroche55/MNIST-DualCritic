@@ -2,8 +2,8 @@
 
 Usage (from the repository root)::
 
-    uv run --with mlx python -m generator.sample --checkpoint outputs/checkpoints/ddpm/best --digit 7
-    uv run --with mlx python -m generator.sample --checkpoint outputs/checkpoints/ddpm/best --digit 3 \\
+    uv run python -m generator.sample --checkpoint outputs/checkpoints/ddpm/best --digit 7
+    uv run python -m generator.sample --checkpoint outputs/checkpoints/ddpm/best --digit 3 \\
         --count 64 --seed 1 --output-dir outputs/generated
 """
 

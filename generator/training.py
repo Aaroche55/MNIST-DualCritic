@@ -2,8 +2,8 @@
 
 Usage (from the repository root)::
 
-    uv run --with mlx python -m generator.training --epochs 20 --run-name ddpm
-    uv run --with mlx python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30
+    uv run python -m generator.training --epochs 20 --run-name ddpm
+    uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30
 
 Data is read through the existing read-only interface ``mnist_dualcritic.data.Dataset.from_directory``; nothing
 under ``data/`` is written. The test split is refused by ``load_split`` so it cannot be used for training or for

@@ -1,13 +1,12 @@
 """Smoke tests for the MLX diffusion generator, using small random arrays only (no MNIST is read or downloaded)."""
 
+import mlx.core as mx
 import numpy as np
 import pytest
 
-mx = pytest.importorskip("mlx.core", reason="the generator needs MLX: uv run --with mlx pytest")
-
-from generator.diffusion import DiffusionConfig, GaussianDiffusion  # noqa: E402
-from generator.model import ConditionalUNet, ModelConfig  # noqa: E402
-from generator.training import (  # noqa: E402
+from generator.diffusion import DiffusionConfig, GaussianDiffusion
+from generator.model import ConditionalUNet, ModelConfig
+from generator.training import (
     TrainConfig,
     load_checkpoint,
     load_optimizer_state,
