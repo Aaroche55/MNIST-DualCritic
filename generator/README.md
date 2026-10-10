@@ -14,12 +14,12 @@ MLX is a project dependency, so `uv sync` installs it.
 
 ## Model
 
-`ConditionalUNet` predicts the noise in a noisy image (default: about 0.93 M parameters):
+`ConditionalUNet` predicts the noise in a noisy image (default: about 3.7 M parameters; 64 base channels, 256-wide conditioning):
 
 ```
-x (B, 28, 28, 1) ─ conv ─ ResBlock 32 ─┬─ down ─ ResBlock 64 ─┬─ down ─ 2 × ResBlock 128 (7×7)
-                                       │                      └──────── up ─ concat ─ ResBlock 64
-                                       └─────────────────────────────── up ─ concat ─ ResBlock 32 ─ conv ─ ε̂ (B, 28, 28, 1)
+x (B, 28, 28, 1) ─ conv ─ ResBlock 64 ─┬─ down ─ ResBlock 128 ─┬─ down ─ 2 × ResBlock 256 (7×7)
+                                       │                       └──────── up ─ concat ─ ResBlock 128
+                                       └──────────────────────────────── up ─ concat ─ ResBlock 64 ─ conv ─ ε̂ (B, 28, 28, 1)
 ```
 
 | Input | Shape | Type | Meaning |
@@ -84,7 +84,7 @@ uv run python -m generator.training --epochs 20 --run-name ddpm
 uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30   # continue to epoch 30
 ```
 
-Other options: `--batch-size` (128), `--lr` (2e-4, Adam), `--seed` (0), `--base-channels` (32), `--timesteps`
+Other options: `--batch-size` (128), `--lr` (2e-4, Adam), `--seed` (0), `--base-channels` (64), `--timesteps`
 (1000) and `--output-dir` (`outputs`). From Python:
 
 ```python

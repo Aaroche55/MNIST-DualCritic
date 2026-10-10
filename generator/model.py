@@ -23,9 +23,9 @@ class ModelConfig:
     image_size: int = 28
     image_channels: int = 1
     num_classes: int = 10
-    base_channels: int = 32
+    base_channels: int = 64
     channel_mults: tuple[int, ...] = (1, 2)  # one entry per resolution: 28x28, 14x14, then the 7x7 middle
-    emb_dim: int = 128
+    emb_dim: int = 256
     norm_groups: int = 8
 
     def __post_init__(self):
