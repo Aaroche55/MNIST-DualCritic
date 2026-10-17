@@ -1,7 +1,8 @@
-"""Train the class-conditional DDPM on ``data/splits/train`` and track denoising loss on ``data/splits/validation``.
+"""Train the class-conditional DDPM on ``data/mnist/splits/train`` and track denoising loss on its ``validation``.
 
 Usage (from the repository root)::
 
+    uv run data split --validation 10000 -t all       # write the splits once (see mnist_dualcritic.cli)
     uv run python -m generator.training --epochs 20 --run-name ddpm
     uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30
 
@@ -30,10 +31,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from generator.diffusion import DiffusionConfig, GaussianDiffusion
 from generator.model import ConditionalUNet, ModelConfig
-from mnist_dualcritic.data import METADATA_FILENAME, Dataset
+from mnist_dualcritic.data import METADATA_FILENAME, MNIST, Dataset
 
 DATA_DIR = Path("data")
-SPLITS_DIR = DATA_DIR / "splits"
+SPLITS_DIR = MNIST(DATA_DIR).splits_dir  # written by `data split`
 OUTPUT_DIR = Path("outputs")
 TRAIN_SPLIT = "train"
 VALIDATION_SPLIT = "validation"
@@ -78,13 +79,15 @@ def load_split(name: str, splits_dir: Path = SPLITS_DIR) -> Dataset:
 
 
 def split_record(name: str, splits_dir: Path = SPLITS_DIR) -> dict:
-    """Name, path and file hashes of a split, read from its metadata.json, to record what a checkpoint saw."""
+    """Where a split came from, read from its metadata.json, to record exactly what a checkpoint saw."""
     directory = Path(splits_dir) / name
     record = {"split": name, "path": str(directory)}
     metadata_path = directory / METADATA_FILENAME
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text())
-        record |= {"samples": metadata.get("samples"), "sha256": metadata.get("sha256")}
+        # Partition, indices hash and transforms pin down which images and augmentations were used
+        provenance = ("source", "partition", "indices_sha256", "include_original", "transforms", "samples", "sha256")
+        record |= {key: metadata.get(key) for key in provenance}
     return record
 
 

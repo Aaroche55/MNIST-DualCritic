@@ -54,6 +54,13 @@ so changing the defaults does not affect checkpoints that already exist.
 
 ## Data, normalisation and batch format
 
+Create the splits once with the dataset CLI (see `mnist_dualcritic.cli`), which writes them to
+`data/mnist/splits/`:
+
+```sh
+uv run data split --validation 10000 -t all
+```
+
 The generator reads the prepared splits through the existing read-only interface
 `mnist_dualcritic.data.Dataset.from_directory(path)`. That call returns `images` as `(N, 28, 28)` uint8 in
 [0, 255] and `labels` as `(N,)` uint8. The generator never writes under `data/` and refuses any output path
@@ -70,9 +77,13 @@ Generated images are mapped back with `round((clip(x, −1, 1) + 1) · 127.5)`.
 
 | Split | Samples | Used for |
 | --- | --- | --- |
-| `data/splits/train` | 168,000 (42,000 originals plus rotated, translated and brightness-adjusted copies) | Gradient updates. Reshuffled every epoch with a seeded permutation. |
-| `data/splits/validation` | 14,000 originals | Denoising loss after each epoch, with timesteps and noise fixed by the seed so epochs are comparable. Selects the `best` checkpoint. |
-| `data/splits/test` | 14,000 originals | **Not used.** |
+| `data/mnist/splits/train` | 200,000 (50,000 originals plus rotated, translated and brightness-adjusted copies) | Gradient updates. Reshuffled every epoch with a seeded permutation. |
+| `data/mnist/splits/validation` | 10,000 originals | Denoising loss after each epoch, with timesteps and noise fixed by the seed so epochs are comparable. Selects the `best` checkpoint. |
+| `data/mnist/splits/test` | 10,000 originals: the official MNIST test set | **Not used.** |
+
+Validation is a stratified sample held out from the official 60,000-image train partition *before* augmentation,
+and only the remaining 50,000 images are augmented, so no copy of a validation image is trained on. Test is the
+official partition, unchanged, because the pretrained OCR critic was trained on the official train partition.
 
 **Do not touch the test split until final evaluation.** Do not use it for training, checkpoint selection,
 hyperparameter tuning or looking at samples. `training.load_split("test")` raises an error on purpose.
@@ -115,8 +126,8 @@ outputs/
 - the training settings, including the seed, the epochs completed and the step;
 - the image normalisation;
 - the metrics;
-- the name, path, sample count and SHA-256 hashes of the train and validation splits, taken from their
-  `metadata.json`.
+- for the train and validation splits: name, path, source partition, a hash of the selected image indices,
+  the transforms applied, sample count and file SHA-256 hashes, taken from their `metadata.json`.
 
 ## Sampling
 
