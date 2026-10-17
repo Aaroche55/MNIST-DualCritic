@@ -56,8 +56,8 @@ def test_rejects_truncated_header(tmp_path, reader):
 @pytest.mark.parametrize(
     ("body", "message"),
     [
-        (lambda images: images.tobytes(), "header says 7 images, found 6"),
-        (lambda images: images.tobytes()[:-5], "header says 7 images, found 5.96528"),
+        (lambda images: images.tobytes(), "header says 41 images, found 40"),
+        (lambda images: images.tobytes()[:-5], "header says 41 images, found 39.9653"),
     ],
     ids=["missing image", "truncated image"],
 )

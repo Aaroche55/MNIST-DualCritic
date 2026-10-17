@@ -1,10 +1,11 @@
 import json
+from typing import ClassVar
 
 import numpy as np
 import pytest
 
 from mnist_dualcritic import data
-from mnist_dualcritic.data import DATASETS, MNIST, Brightness, Dataset, Rotation, get_dataset
+from mnist_dualcritic.data import DATASETS, MNIST, PARTITIONS, Brightness, Dataset, Rotation, SourceDataset
 
 from .conftest import RAW_FILES, TEST, TRAIN, FakeDataset
 
@@ -14,7 +15,7 @@ class TestMNISTConfig:
         assert DATASETS["mnist"] is MNIST
 
     def test_every_raw_file_has_a_checksum(self):
-        raw_paths = {path for pair in MNIST.raw_files for path in pair}
+        raw_paths = {path for pair in MNIST.raw_files.values() for path in pair}
         assert raw_paths == set(MNIST.checksums)
 
     def test_data_dirs_are_per_dataset(self, tmp_path):
@@ -22,6 +23,17 @@ class TestMNISTConfig:
         assert source.raw_dir == tmp_path / "mnist" / "raw"
         assert source.formatted_dir == tmp_path / "mnist" / "formatted"
         assert source.transforms_dir == tmp_path / "mnist" / "transforms"
+        assert source.splits_dir == tmp_path / "mnist" / "splits"
+
+    def test_raw_files_cover_the_partitions(self):
+        assert tuple(MNIST.raw_files) == PARTITIONS
+
+    def test_missing_partition_rejected(self):
+        with pytest.raises(ValueError, match="must have exactly the partitions"):
+
+            class TrainOnly(SourceDataset):
+                name = "train-only"
+                raw_files: ClassVar[dict[str, tuple[str, str]]] = {"train": ("images", "labels")}
 
 
 class TestRawFiles:
@@ -66,6 +78,19 @@ class TestFormatAndPrepare:
         dataset = raw_source.load()
         np.testing.assert_array_equal(dataset.images, np.concatenate([TRAIN[0], TEST[0]]))
         np.testing.assert_array_equal(dataset.labels, np.concatenate([TRAIN[1], TEST[1]]))
+
+    def test_format_records_partitions(self, raw_source):
+        raw_source.format()
+        n_train = len(TRAIN[1])
+        assert raw_source.partitions() == {"train": range(n_train), "test": range(n_train, n_train + len(TEST[1]))}
+
+    def test_labels_match_load(self, source):
+        np.testing.assert_array_equal(source.labels(), source.load().labels)
+
+    def test_formatted_data_without_metadata_is_rebuilt(self, source):
+        # Formatted directories written before partitions were recorded have no metadata.json
+        (source.formatted_dir / data.METADATA_FILENAME).unlink()
+        assert len(source.partitions()["test"]) == len(TEST[1])
 
     def test_prepare_downloads_and_formats_once(self, data_dir, serve_zip):
         requests = serve_zip()
@@ -145,29 +170,3 @@ class TestTransformCache:
         source.transformed(transform)
         assert not partial.exists()
         assert list(source.cached_transforms()) == [transform.key]
-
-
-class TestGetDataset:
-    def test_composes_original_then_transforms(self, source):
-        original = source.load()
-        transforms = [Rotation(seed=1), Brightness(seed=2)]
-        dataset = get_dataset(source, *transforms)
-
-        n = len(original)
-        assert len(dataset) == 3 * n
-        np.testing.assert_array_equal(dataset.images[:n], original.images)
-        for i, transform in enumerate(transforms, start=1):
-            np.testing.assert_array_equal(dataset.images[i * n : (i + 1) * n], source.transformed(transform).images)
-        np.testing.assert_array_equal(dataset.labels, np.tile(original.labels, 3))
-
-    def test_without_original(self, source):
-        dataset = get_dataset(source, Rotation(), include_original=False)
-        np.testing.assert_array_equal(dataset.images, source.transformed(Rotation()).images)
-
-    def test_nothing_selected_gives_empty_dataset(self, source):
-        dataset = get_dataset(source, include_original=False)
-        assert dataset.images.shape == (0, *TRAIN[0].shape[1:])
-
-    def test_caches_transforms(self, source):
-        get_dataset(source, Rotation())
-        assert source.is_cached(Rotation())
