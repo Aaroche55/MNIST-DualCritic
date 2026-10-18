@@ -1,8 +1,10 @@
+import json
+
 import numpy as np
 import pytest
 
 from mnist_dualcritic.cli import main, render
-from mnist_dualcritic.data import Brightness, Rotation, Translation
+from mnist_dualcritic.data import Brightness, Dataset, Rotation, Translation
 
 from .conftest import TEST, TRAIN
 
@@ -63,12 +65,41 @@ def test_invalid_parameters_reported(run):
         run("generate", "-t", "brightness", "--min-scale", "2")
 
 
-def test_info_counts_composed_dataset(run):
+def test_info_counts_composed_train_partition(run):
     output = run("info", "-t", "rotation", "--seed", "0", "1")
-    assert f"Samples:  {3 * SAMPLES}" in output
+    assert f"Samples:  {3 * len(TRAIN[1])}" in output
     assert "Image:    12x12 uint8" in output
 
-    assert f"Samples:  {SAMPLES}" in run("info", "-t", "rotation", "--no-original")
+    assert f"Samples:  {len(TRAIN[1])}" in run("info", "-t", "rotation", "--no-original")
+
+
+def test_info_test_partition(run):
+    assert f"Samples:  {len(TEST[1])}" in run("info", "-p", "test")
+
+
+def test_split_saves_train_validation_and_test(run, source):
+    output = run("split", "--validation", "0.25", "-t", "rotation", "--split-seed", "1")
+    assert "train" in output
+    splits = {name: Dataset.from_directory(source.splits_dir / name) for name in ("train", "validation", "test")}
+    held_out = len(TRAIN[1]) // 4
+    assert len(splits["validation"]) == held_out
+    assert len(splits["train"]) == 2 * (len(TRAIN[1]) - held_out)
+    np.testing.assert_array_equal(splits["test"].images, TEST[0])
+
+    metadata = json.loads((source.splits_dir / "train" / "metadata.json").read_text())
+    assert metadata["partition"] == "train"
+    assert [t["key"] for t in metadata["transforms"]] == [Rotation().key]
+
+
+def test_split_accepts_a_count_and_output_dir(run, tmp_path):
+    run("split", "--validation", "7", "-o", str(tmp_path / "out"))
+    assert len(Dataset.from_directory(tmp_path / "out" / "validation")) == 7
+
+
+@pytest.mark.parametrize("size", ["0", str(len(TRAIN[1])), "1.5"])
+def test_split_rejects_impossible_sizes(run, size):
+    with pytest.raises(SystemExit, match="Invalid split"):
+        run("split", "--validation", size)
 
 
 def test_info_without_anything_selected(run):

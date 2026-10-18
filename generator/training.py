@@ -1,13 +1,16 @@
-"""Train the class-conditional DDPM on ``data/splits/train`` and track denoising loss on ``data/splits/validation``.
+"""Train the class-conditional DDPM on augmented MNIST and track denoising loss on a held-out validation set.
 
 Usage (from the repository root)::
 
     uv run python -m generator.training --epochs 20 --run-name ddpm
+    uv run python -m generator.training --validation 0.2 --split-seed 1 -t rotation -t translation
     uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epochs 30
 
-Data is read through the existing read-only interface ``mnist_dualcritic.data.Dataset.from_directory``; nothing
-under ``data/`` is written. The test split is refused by ``load_split`` so it cannot be used for training or for
-choosing checkpoints. Outputs::
+The data is built on every run through ``mnist_dualcritic.data`` (see ``load_data``): validation is held out from
+the official train partition, then only the remaining images are augmented to make train. The official test
+partition is never loaded, so it cannot be used for training or for choosing checkpoints. The data library
+downloads MNIST and caches transform outputs under ``data/`` on first use; the generator itself never writes
+there. Outputs::
 
     outputs/checkpoints/<run>/last/   model.safetensors, optimizer.safetensors, config.json (after every epoch)
     outputs/checkpoints/<run>/best/   the same, for the epoch with the lowest validation loss so far
@@ -30,14 +33,21 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from generator.diffusion import DiffusionConfig, GaussianDiffusion
 from generator.model import ConditionalUNet, ModelConfig
-from mnist_dualcritic.data import METADATA_FILENAME, Dataset
+from mnist_dualcritic.cli import count_or_fraction
+from mnist_dualcritic.data import (
+    DATASETS,
+    TRANSFORMS,
+    Brightness,
+    Dataset,
+    Rotation,
+    Subset,
+    Transform,
+    Translation,
+    get_dataset,
+)
 
 DATA_DIR = Path("data")
-SPLITS_DIR = DATA_DIR / "splits"
 OUTPUT_DIR = Path("outputs")
-TRAIN_SPLIT = "train"
-VALIDATION_SPLIT = "validation"
-ALLOWED_SPLITS = (TRAIN_SPLIT, VALIDATION_SPLIT)
 
 NORMALISATION = {
     "source": "uint8 greyscale in [0, 255], arrays of shape (N, 28, 28)",
@@ -60,8 +70,24 @@ class TrainConfig:
     adam_betas: tuple[float, float] = (0.9, 0.999)
     adam_eps: float = 1e-8
     run_name: str = "ddpm"
-    splits_dir: str = str(SPLITS_DIR)
     output_dir: str = str(OUTPUT_DIR)
+
+
+@dataclass(frozen=True)
+class DataConfig:
+    """How train and validation are built: which images are held out, and how the rest are augmented."""
+
+    dataset: str = "mnist"
+    data_dir: str = str(DATA_DIR)
+    validation: int | float = 10_000  # images held out of the train partition: a count or a fraction
+    split_seed: int = 0
+    stratify: bool = True
+    transforms: tuple[Transform, ...] = (Rotation(), Translation(), Brightness())
+    include_original: bool = True
+
+    def record(self) -> dict:
+        """JSON-ready settings; asdict() would drop each transform's name, which is a class attribute."""
+        return asdict(self) | {"transforms": [{"name": t.name, "params": t.params} for t in self.transforms]}
 
 
 def ensure_outside_data(path: Path):
@@ -70,22 +96,27 @@ def ensure_outside_data(path: Path):
         raise ValueError(f"Refusing to write under {DATA_DIR}/: {path}")
 
 
-def load_split(name: str, splits_dir: Path = SPLITS_DIR) -> Dataset:
-    """Read a prepared split. Only train and validation are allowed; test is kept for final evaluation."""
-    if name not in ALLOWED_SPLITS:
-        raise ValueError(f"Split {name!r} is not available to the generator (allowed: {', '.join(ALLOWED_SPLITS)})")
-    return Dataset.from_directory(Path(splits_dir) / name)
+def load_data(config: DataConfig) -> tuple[Subset, Subset]:
+    """(train, validation): validation held out from the official train partition, then train augmented."""
+    source = DATASETS[config.dataset](Path(config.data_dir))
+    pool, _ = get_dataset(source)  # the official test partition is kept for final evaluation only
+    train, validation = pool.split(config.validation, seed=config.split_seed, stratify=config.stratify)
+    return train.transform(*config.transforms, include_original=config.include_original), validation
 
 
-def split_record(name: str, splits_dir: Path = SPLITS_DIR) -> dict:
-    """Name, path and file hashes of a split, read from its metadata.json, to record what a checkpoint saw."""
-    directory = Path(splits_dir) / name
-    record = {"split": name, "path": str(directory)}
-    metadata_path = directory / METADATA_FILENAME
-    if metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text())
-        record |= {"samples": metadata.get("samples"), "sha256": metadata.get("sha256")}
-    return record
+def data_record(train: Subset, validation: Subset) -> dict:
+    """Exactly which images and augmentations each side holds, as saved in checkpoint configs."""
+    # Round-trip through JSON so a record built now compares equal to one read back from config.json
+    return json.loads(json.dumps({"train": train.describe(), "validation": validation.describe()}))
+
+
+def ensure_same_data(saved: dict, train: Subset, validation: Subset):
+    """Refuse to resume on different data, which could put a run's validation images into its training set."""
+    if saved.get("data") != data_record(train, validation):
+        raise ValueError(
+            "This checkpoint was trained on different data; resume with the --validation, --split-seed and"
+            " --transform options it was started with (see the data_config section of its config.json)"
+        )
 
 
 def normalise(images: np.ndarray) -> mx.array:
@@ -147,11 +178,12 @@ def checkpoint_config(
     train_config: TrainConfig,
     model_config: ModelConfig,
     diffusion_config: DiffusionConfig,
+    data_config: DataConfig,
+    data: dict,
     epoch: int,
     step: int,
     metrics: dict,
 ) -> dict:
-    splits_dir = Path(train_config.splits_dir)
     return {
         "model": asdict(model_config),
         "diffusion": asdict(diffusion_config),
@@ -164,10 +196,8 @@ def checkpoint_config(
         "training": asdict(train_config) | {"epochs_completed": epoch, "step": step},
         "seed": train_config.seed,
         "normalisation": NORMALISATION,
-        "data": {
-            "train": split_record(TRAIN_SPLIT, splits_dir),
-            "validation": split_record(VALIDATION_SPLIT, splits_dir),
-        },
+        "data_config": data_config.record(),
+        "data": data,
         "metrics": metrics,
     }
 
@@ -204,6 +234,7 @@ def train(
     config: TrainConfig = TrainConfig(),  # noqa: B008 (frozen dataclasses, safe defaults)
     model_config: ModelConfig = ModelConfig(),  # noqa: B008
     diffusion_config: DiffusionConfig = DiffusionConfig(),  # noqa: B008
+    data_config: DataConfig = DataConfig(),  # noqa: B008
     resume: Path | None = None,
 ) -> Path:
     """Train, saving `last` and `best` checkpoints every epoch; returns the run's checkpoint directory."""
@@ -212,9 +243,13 @@ def train(
     for path in (run_dir, metrics_path):
         ensure_outside_data(path)
 
+    train_subset, validation_subset = load_data(data_config)
+    data = data_record(train_subset, validation_subset)
+
     start_epoch, step, best_loss = 0, 0, math.inf
     if resume is not None:
         model, diffusion, saved = load_checkpoint(resume)
+        ensure_same_data(saved, train_subset, validation_subset)
         model_config, diffusion_config = model.config, diffusion.config
         optimizer = make_optimizer(config)
         load_optimizer_state(resume, optimizer)
@@ -227,8 +262,7 @@ def train(
         optimizer = make_optimizer(config)
     mx.eval(model.parameters())
 
-    train_set = load_split(TRAIN_SPLIT, Path(config.splits_dir))
-    validation_set = load_split(VALIDATION_SPLIT, Path(config.splits_dir))
+    train_set, validation_set = train_subset.load(), validation_subset.load()
     num_params = sum(v.size for _, v in tree_flatten(model.parameters()))
     print(f"train {len(train_set)}, validation {len(validation_set)}, parameters {num_params:,}")
 
@@ -265,7 +299,7 @@ def train(
             f"epoch {epoch + 1}: train {train_loss:.4f}, validation {validation_loss:.4f}{' (best)' if improved else ''}"
         )
 
-        saved = checkpoint_config(config, model_config, diffusion_config, epoch + 1, step, metrics)
+        saved = checkpoint_config(config, model_config, diffusion_config, data_config, data, epoch + 1, step, metrics)
         save_checkpoint(run_dir / "last", model, optimizer, saved)
         if improved:
             save_checkpoint(run_dir / "best", model, optimizer, saved)
@@ -273,7 +307,12 @@ def train(
 
 
 def main(argv: list[str] | None = None):
-    defaults, model_defaults, diffusion_defaults = TrainConfig(), ModelConfig(), DiffusionConfig()
+    defaults, model_defaults, diffusion_defaults, data_defaults = (
+        TrainConfig(),
+        ModelConfig(),
+        DiffusionConfig(),
+        DataConfig(),
+    )
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--epochs", type=int, default=defaults.epochs, help="total epochs (also when resuming)")
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
@@ -284,7 +323,36 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--base-channels", type=int, default=model_defaults.base_channels)
     parser.add_argument("--timesteps", type=int, default=diffusion_defaults.num_timesteps)
     parser.add_argument("--resume", type=Path, help="checkpoint directory to continue from, e.g. .../last")
+    data = parser.add_argument_group("data")
+    data.add_argument("--data-dir", default=data_defaults.data_dir)
+    data.add_argument(
+        "--validation",
+        type=count_or_fraction,
+        default=data_defaults.validation,
+        help="images held out of the train partition: a count, or a fraction such as 0.2 (default: %(default)s)",
+    )
+    data.add_argument("--split-seed", type=int, default=data_defaults.split_seed)
+    data.add_argument(
+        "-t",
+        "--transform",
+        action="append",
+        choices=TRANSFORMS,
+        help="augmentation for train, with default parameters; repeat for several"
+        f" (default: {', '.join(t.name for t in data_defaults.transforms)})",
+    )
+    data.add_argument("--no-augment", action="store_true", help="train on the original images only")
     args = parser.parse_args(argv)
+    if args.no_augment and args.transform:
+        parser.error("--no-augment and --transform cannot be combined")
+    if args.no_augment:
+        transforms = ()
+    elif args.transform:
+        transforms = tuple(TRANSFORMS[name]() for name in dict.fromkeys(args.transform))
+    else:
+        transforms = data_defaults.transforms
+    data_config = DataConfig(
+        data_dir=args.data_dir, validation=args.validation, split_seed=args.split_seed, transforms=transforms
+    )
     config = TrainConfig(
         seed=args.seed,
         epochs=args.epochs,
@@ -297,6 +365,7 @@ def main(argv: list[str] | None = None):
         config,
         ModelConfig(base_channels=args.base_channels),
         DiffusionConfig(num_timesteps=args.timesteps),
+        data_config,
         resume=args.resume,
     )
 

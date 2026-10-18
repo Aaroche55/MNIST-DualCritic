@@ -54,10 +54,17 @@ so changing the defaults does not affect checkpoints that already exist.
 
 ## Data, normalisation and batch format
 
-The generator reads the prepared splits through the existing read-only interface
-`mnist_dualcritic.data.Dataset.from_directory(path)`. That call returns `images` as `(N, 28, 28)` uint8 in
-[0, 255] and `labels` as `(N,)` uint8. The generator never writes under `data/` and refuses any output path
-there.
+The generator builds its data on every run through the `mnist_dualcritic.data` API, in `training.load_data()`:
+
+```python
+pool, _ = get_dataset(MNIST())  # official partitions; test is never loaded
+train, validation = pool.split(10_000, seed=0)  # stratified, original images only
+train = train.transform(Rotation(), Translation(), Brightness())
+```
+
+There is no separate preparation step. On first use the data library downloads MNIST and caches each transform's
+output under `data/`; later runs read the cache. Loaded datasets have `images` as `(N, 28, 28)` uint8 in [0, 255]
+and `labels` as `(N,)` uint8. The generator itself never writes under `data/` and refuses any output path there.
 
 `training.batches()` yields:
 
@@ -68,14 +75,18 @@ Generated images are mapped back with `round((clip(x, −1, 1) + 1) · 127.5)`.
 
 ## How the splits are used
 
-| Split | Samples | Used for |
+| Split | Samples (defaults) | Used for |
 | --- | --- | --- |
-| `data/splits/train` | 168,000 (42,000 originals plus rotated, translated and brightness-adjusted copies) | Gradient updates. Reshuffled every epoch with a seeded permutation. |
-| `data/splits/validation` | 14,000 originals | Denoising loss after each epoch, with timesteps and noise fixed by the seed so epochs are comparable. Selects the `best` checkpoint. |
-| `data/splits/test` | 14,000 originals | **Not used.** |
+| train | 200,000 (50,000 originals plus rotated, translated and brightness-adjusted copies) | Gradient updates. Reshuffled every epoch with a seeded permutation. |
+| validation | 10,000 originals | Denoising loss after each epoch, with timesteps and noise fixed by the seed so epochs are comparable. Selects the `best` checkpoint. |
+| test | 10,000 originals: the official MNIST test set | **Not used.** |
+
+Validation is a stratified sample held out from the official 60,000-image train partition *before* augmentation,
+and only the remaining 50,000 images are augmented, so no copy of a validation image is trained on. Test is the
+official partition, unchanged, because the pretrained OCR critic was trained on the official train partition.
 
 **Do not touch the test split until final evaluation.** Do not use it for training, checkpoint selection,
-hyperparameter tuning or looking at samples. `training.load_split("test")` raises an error on purpose.
+hyperparameter tuning or looking at samples. `training.load_data()` discards it on purpose.
 
 ## Training
 
@@ -85,18 +96,30 @@ uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epo
 ```
 
 Other options: `--batch-size` (128), `--lr` (2e-4, Adam), `--seed` (0), `--base-channels` (64), `--timesteps`
-(1000) and `--output-dir` (`outputs`). From Python:
+(1000) and `--output-dir` (`outputs`). Data options:
+
+- `--validation` (10000): images held out of the train partition, as a count or a fraction such as `0.2`;
+- `--split-seed` (0): which images are held out;
+- `-t/--transform` (rotation, translation and brightness): augmentation for train, with default parameters;
+  repeat it for several. `--no-augment` trains on the originals only;
+- `--data-dir` (`data`).
+
+From Python, `DataConfig` also takes transforms with any parameters:
 
 ```python
-from generator.training import TrainConfig, train
+from generator.training import DataConfig, TrainConfig, train
 from generator.model import ModelConfig
 from generator.diffusion import DiffusionConfig
+from mnist_dualcritic.data import Rotation
 
-train(TrainConfig(epochs=20, run_name="ddpm"), ModelConfig(), DiffusionConfig())
+data = DataConfig(validation=0.2, transforms=(Rotation(max_degrees=30), Rotation(max_degrees=30, seed=1)))
+train(TrainConfig(epochs=20, run_name="ddpm"), ModelConfig(), DiffusionConfig(), data)
 ```
 
 Each epoch's shuffle and training noise come from that epoch's own stream derived from `--seed`. So a run that is
-stopped and resumed from `last` sees the same data order as one that ran straight through.
+stopped and resumed from `last` sees the same data order as one that ran straight through. Resume with the same
+data options the run started with: if the rebuilt train or validation set differs from the one recorded in the
+checkpoint, training refuses to continue, because a different split could put validation images into training.
 
 Outputs (`outputs/` is gitignored, so don't commit checkpoints or images):
 
@@ -115,8 +138,9 @@ outputs/
 - the training settings, including the seed, the epochs completed and the step;
 - the image normalisation;
 - the metrics;
-- the name, path, sample count and SHA-256 hashes of the train and validation splits, taken from their
-  `metadata.json`.
+- the data settings (`data_config`);
+- for the train and validation sets (`data`): source, partition, image count, a hash of the selected image
+  indices and the transforms applied, from `Subset.describe()`. Resuming checks this.
 
 ## Sampling
 
