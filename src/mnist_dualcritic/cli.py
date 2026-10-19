@@ -6,7 +6,10 @@ Usage::
     uv run data download                              # fetch the raw files (skipped if checksums match)
     uv run data generate -t all                       # cache the rotation, translation and brightness outputs
     uv run data generate -t rotation --max-degrees 30 --seed 0 1 2    # three differently rotated copies
-    uv run data info -t rotation -t brightness        # size and label balance of the composed dataset
+    uv run data info -t rotation -t brightness        # size and label balance of the augmented train partition
+    uv run data info -p test                          # the official test partition
+    uv run data split --validation 10000 -t all       # hold out validation, augment the rest as train, and write
+                                                      # train, validation and test to data/mnist/splits/
     uv run data show -i 0 -n 3 -t all                 # ASCII preview: each original beside its transforms
     uv run data clean -t rotation --max-degrees 30 --seed 0 1 2       # delete those three cached outputs
     uv run data clean                                 # delete every cached output
@@ -17,7 +20,9 @@ as ``--max-degrees``. Those flags are generated from the ``Transform`` dataclass
 here without any CLI changes.
 
 Each command maps directly onto the library: ``data info -t rotation --seed 0 1`` describes
-``get_dataset(MNIST(), Rotation(seed=0), Rotation(seed=1))``.
+``get_dataset(MNIST()).train.transform(Rotation(seed=0), Rotation(seed=1))``, and ``data split --validation 0.2
+-t rotation --split-seed 3`` saves ``get_dataset(MNIST()).train.split(0.2, seed=3)`` with ``Rotation()`` then
+applied to its training side, plus the untouched test partition.
 """
 
 import argparse
@@ -27,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mnist_dualcritic.data import DATASETS, TRANSFORMS, Dataset, SourceDataset, Transform, get_dataset
+from mnist_dualcritic.data import DATASETS, PARTITIONS, TRANSFORMS, Dataset, SourceDataset, Transform, get_dataset
 
 ASCII_RAMP = ' ."-+oOM#@'
 
@@ -133,11 +138,12 @@ def cmd_info(args):
     transforms = get_transforms(args)
     if args.no_original and not transforms:
         raise SystemExit("Nothing to describe: --no-original was given without any --transform")
-    dataset = get_dataset(source, *transforms, include_original=not args.no_original)
+    subset = getattr(get_dataset(source), args.partition)
+    dataset = subset.transform(*transforms, include_original=not args.no_original).load()
 
-    print("Composed from:")
+    print(f"Composed from the {args.partition} partition ({len(subset.indices)} images):")
     if not args.no_original:
-        print(f"  original   {len(source.load()):>6} samples")
+        print("  original")
     for transform in transforms:
         print(f"  {transform.key}  {format_params(transform.params)}")
     print(f"Samples:  {len(dataset)}")
@@ -147,6 +153,25 @@ def cmd_info(args):
     values, counts = np.unique(dataset.labels, return_counts=True)
     for value, count in zip(values, counts, strict=True):
         print(f"  {value:>3}: {count:>6} ({count / len(dataset):.1%})")
+
+
+def cmd_split(args):
+    source = get_source(args)
+    transforms = get_transforms(args)
+    if args.no_original and not transforms:
+        raise SystemExit("Nothing to train on: --no-original was given without any --transform")
+    pool, test = get_dataset(source)
+    try:
+        train, validation = pool.split(args.validation, seed=args.split_seed, stratify=not args.no_stratify)
+    except ValueError as error:
+        raise SystemExit(f"Invalid split: {error}") from None
+    # Augment only after holding out validation, so no copy of a validation image is trained on
+    train = train.transform(*transforms, include_original=not args.no_original)
+
+    output = args.output or source.splits_dir
+    for name, subset in {"train": train, "validation": validation, "test": test}.items():
+        subset.save(output / name)
+        print(f"{name:<10} {len(subset):>7} samples  ({len(subset.indices)} images)  -> {output / name}")
 
 
 def cmd_show(args):
@@ -166,6 +191,17 @@ def cmd_show(args):
         print(f"#{i}  label={original.labels[i]}")
         print(render([d.images[i] for _, d in columns], [title for title, _ in columns]))
         print()
+
+
+def count_or_fraction(value: str) -> int | float:
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a count or a fraction, got {value!r}") from None
 
 
 def bounded_int(minimum: int):
@@ -252,8 +288,30 @@ def build_parser() -> argparse.ArgumentParser:
     sub = subparsers.add_parser(
         "info", parents=[transform_options], help="print size, image shape and label distribution of a composed dataset"
     )
+    sub.add_argument(
+        "-p", "--partition", choices=PARTITIONS, default="train", help="partition to describe (default: %(default)s)"
+    )
     sub.add_argument("--no-original", action="store_true", help="exclude the untransformed samples")
     sub.set_defaults(func=cmd_info)
+
+    sub = subparsers.add_parser(
+        "split",
+        parents=[transform_options],
+        help="hold out validation from the train partition, augment the rest as train, and save both with test",
+    )
+    sub.add_argument(
+        "--validation",
+        type=count_or_fraction,
+        default=10_000,
+        help="images to hold out: a count, or a fraction such as 0.2 (default: %(default)s)",
+    )
+    sub.add_argument("--split-seed", type=int, default=0, help="seed for choosing validation (default: %(default)s)")
+    sub.add_argument("--no-stratify", action="store_true", help="ignore class balance when choosing validation")
+    sub.add_argument("--no-original", action="store_true", help="train only on the augmented copies")
+    sub.add_argument(
+        "-o", "--output", type=Path, help="directory for train/, validation/ and test/ (default: <dataset>/splits)"
+    )
+    sub.set_defaults(func=cmd_split)
 
     sub = subparsers.add_parser("show", parents=[transform_options], help="preview samples as ASCII art")
     sub.add_argument(

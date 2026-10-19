@@ -6,24 +6,44 @@ Library usage::
 
     source = MNIST()  # files live under ./data/mnist/; MNIST(Path("elsewhere")) changes the root
 
-    # The original samples plus one augmented copy per transform, each generated and cached on first use
-    dataset = get_dataset(source, Rotation(), Translation(std_pixels=3), Brightness(seed=1))
-    dataset.images  # (N, 28, 28) uint8
+    # The official partitions. Test stays exactly as published, since pretrained MNIST classifiers (such as the
+    # OCR critic) were trained on the official train partition and are only fairly scored on its test partition
+    pool, test = get_dataset(source)
+
+    # Split first: hold out a stratified validation set of original images (a count, or a fraction like 0.2).
+    # Then augment only the remaining images to make train, so no copy of a validation image is trained on
+    train, validation = pool.split(10_000, seed=0)
+    train = train.transform(Rotation(), Translation(std_pixels=3))
+    # pool.transform(...).split(...) raises: splitting must come before transforming
+
+    # Or k-fold cross-validation: five (train, validation) pairs whose validation sides partition the pool
+    for train, validation in pool.kfold(5, seed=0):
+        train = train.transform(Rotation())
+        ...
+
+    # Subsets are lazy descriptions; nothing is read or generated until load()
+    dataset = train.load()
+    dataset.images  # (N, 28, 28) uint8: the originals, then one augmented copy per transform
     dataset.labels  # (N,) uint8
+    train.describe()                       # JSON-ready provenance: partition, indices hash, transforms
+    train.save(source.splits_dir / "train")  # IDX files plus metadata.json, for Dataset.from_directory
 
     # Different seeds give differently randomised copies of the same transform
-    rotations = get_dataset(source, *(Rotation(seed=s) for s in range(3)), include_original=False)
+    rotations = pool.transform(*(Rotation(seed=s) for s in range(3)), include_original=False)
 
-    source.prepare()                # just the original data, downloading and formatting it if needed
-    source.transformed(Rotation())  # a single transform's output
+    source.prepare()                # every original sample, all partitions, downloading and formatting if needed
+    source.partitions()             # {"train": range(0, 60000), "test": range(60000, 70000)}
+    source.transformed(Rotation())  # a single transform's output over the whole source
     source.cached_transforms()      # {key: metadata} for every cached output
 
 On disk, each dataset gets its own directory::
 
     data/<dataset>/
         raw/                       downloaded files, each verified by SHA-256
-        formatted/                 the train and test splits merged into one IDX image/label pair
+        formatted/                 the partitions merged into one IDX image/label pair, with metadata.json
+                                   recording where each partition lies
         transforms/<name>-<hash>/  one cached transform output: IDX images, labels and metadata.json
+        splits/<name>/             subsets written by Subset.save() or ``data split``
 
 Transforms are frozen dataclasses whose fields, including ``seed``, are their parameters. Each one is
 deterministic, so its output is cached under a key hashed from its name, ``version`` and parameters, and
@@ -41,8 +61,12 @@ Adding a transform::
             images = np.rint(np.abs(dataset.images - self.amount * 255)).astype(np.uint8)
             return Dataset(images=images, labels=dataset.labels.copy())
 
-Adding a dataset means subclassing ``SourceDataset`` with ``name``, ``url``, ``raw_files`` and ``checksums``;
-override ``format()`` if the raw files need more than concatenating (EMNIST's images are stored transposed).
+Transforms are applied to the whole source and cached once; subsets take rows from that output. So a transform's
+output for one sample must not depend on any other sample.
+
+Adding a dataset means subclassing ``SourceDataset`` with ``name``, ``url``, ``raw_files`` (one file pair per
+partition in ``PARTITIONS``) and ``checksums``; override ``read_raw()`` if the raw files need more than reading
+(EMNIST's images are stored transposed).
 
 For the command line, see ``mnist_dualcritic.cli``.
 """
@@ -55,7 +79,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from pathlib import Path
-from typing import ClassVar, Self
+from typing import ClassVar, NamedTuple, Self
 from urllib.request import urlopen
 from zipfile import ZipFile
 
@@ -71,6 +95,10 @@ IMAGES_FILENAME = "images.idx3-ubyte"
 LABELS_FILENAME = "labels.idx1-ubyte"
 METADATA_FILENAME = "metadata.json"
 PARTIAL_SUFFIX = ".partial"
+
+# Every source ships these official partitions. The test partition is what pretrained MNIST classifiers are
+# scored on, so it is kept exactly as published and never mixed into training or validation.
+PARTITIONS = ("train", "test")
 
 # Name -> class lookups used by the CLI; each subclass registers itself when defined, wherever it lives
 DATASETS: dict[str, type["SourceDataset"]] = {}
@@ -109,6 +137,11 @@ def read_idx_labels(path: Path) -> np.ndarray:
 
 def read_idx_images(path: Path) -> np.ndarray:
     return _read_idx(path, IDX_IMAGES_MAGIC, ndim=3, kind="images")
+
+
+def _sha256(path: Path) -> str:
+    with path.open("rb") as file:
+        return file_digest(file, "sha256").hexdigest()
 
 
 def _require_uint8(name: str, array: np.ndarray):
@@ -182,11 +215,36 @@ class Dataset:
         )
 
 
+def _save_with_metadata(directory: Path, dataset: Dataset, metadata: dict):
+    """Write a dataset and its metadata.json, describing the files as well as how they were made.
+
+    The output is built beside `directory` and swapped in, so an interrupted run never leaves a directory that
+    looks complete (e.g. old metadata next to half-written images).
+    """
+    partial = directory.with_name(directory.name + PARTIAL_SUFFIX)
+    shutil.rmtree(partial, ignore_errors=True)
+    dataset.save(partial)
+    metadata = {
+        **metadata,
+        "samples": len(dataset),
+        "image_shape": list(dataset.images.shape[1:]),
+        "label_counts": np.bincount(dataset.labels).tolist(),
+        "sha256": {filename: _sha256(partial / filename) for filename in (IMAGES_FILENAME, LABELS_FILENAME)},
+        "created": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    (partial / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
+    shutil.rmtree(directory, ignore_errors=True)
+    partial.rename(directory)
+
+
 @dataclass(frozen=True)
 class Transform:
     """A deterministic augmentation. Its fields are its parameters, and together they identify its cached output.
 
     Bump `version` whenever the transform's algorithm changes so stale cached outputs are regenerated.
+
+    A transform is applied to the whole source once and its output cached; subsets then take the rows they need.
+    So sample i's output must depend only on sample i and the i-th draws from `rng`, never on other samples.
     """
 
     name: ClassVar[str]
@@ -225,19 +283,22 @@ class SourceDataset:
 
     name: ClassVar[str]
     url: ClassVar[str]
-    # (images, labels) file pairs relative to the raw directory, merged in order by format()
-    raw_files: ClassVar[tuple[tuple[str, str], ...]]
+    # partition -> (images, labels) file pair relative to the raw directory, one entry per name in PARTITIONS
+    raw_files: ClassVar[dict[str, tuple[str, str]]]
     # SHA-256 of every file in raw_files, so verification ignores unrelated files in the raw directory
     checksums: ClassVar[dict[str, str]]
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+        if "raw_files" in cls.__dict__ and set(cls.raw_files) != set(PARTITIONS):
+            raise ValueError(f"{cls.__qualname__}.raw_files must have exactly the partitions {PARTITIONS}")
         _register(DATASETS, cls)
 
     def __init__(self, data_dir: Path = Path("./data")):
         self.raw_dir = data_dir / self.name / "raw"
         self.formatted_dir = data_dir / self.name / "formatted"
         self.transforms_dir = data_dir / self.name / "transforms"
+        self.splits_dir = data_dir / self.name / "splits"
 
     def invalid_raw_files(self) -> list[str]:
         """Raw files that are missing or don't match their expected checksum."""
@@ -269,21 +330,45 @@ class SourceDataset:
         if invalid := self.invalid_raw_files():
             raise RuntimeError(f"Downloaded {self.name} files failed checksum verification: {', '.join(invalid)}")
 
+    def read_raw(self, partition: str) -> Dataset:
+        """One partition straight from the raw files. Override if they need more than reading (e.g. transposing)."""
+        images, labels = self.raw_files[partition]
+        return Dataset(images=read_idx_images(self.raw_dir / images), labels=read_idx_labels(self.raw_dir / labels))
+
     def format(self):
-        images = np.concatenate([read_idx_images(self.raw_dir / images) for images, _ in self.raw_files])
-        labels = np.concatenate([read_idx_labels(self.raw_dir / labels) for _, labels in self.raw_files])
-        Dataset(images=images, labels=labels).save(self.formatted_dir)
+        """Merge the partitions, in PARTITIONS order, into one dataset that records where each one lies."""
+        parts = [self.read_raw(partition) for partition in PARTITIONS]
+        bounds = np.cumsum([0, *map(len, parts)]).tolist()
+        metadata = {
+            "source": self.name,
+            "partitions": {name: bounds[i : i + 2] for i, name in enumerate(PARTITIONS)},
+        }
+        _save_with_metadata(self.formatted_dir, Dataset.concatenate(parts), metadata)
 
     def load(self) -> Dataset:
         return Dataset.from_directory(self.formatted_dir)
 
-    def prepare(self, force_download: bool = False) -> Dataset:
-        """Download and format if needed, then load."""
-        formatted = (self.formatted_dir / IMAGES_FILENAME, self.formatted_dir / LABELS_FILENAME)
-        if force_download or not all(path.exists() for path in formatted):
+    def ensure_formatted(self, force_download: bool = False):
+        """Download and format if needed. Formatted data without metadata predates partitions and is rebuilt."""
+        if force_download or not (self.formatted_dir / METADATA_FILENAME).exists():
             self.download(force=force_download)
             self.format()
+
+    def prepare(self, force_download: bool = False) -> Dataset:
+        """Download and format if needed, then load every sample, all partitions included."""
+        self.ensure_formatted(force_download)
         return self.load()
+
+    def partitions(self) -> dict[str, range]:
+        """Where each official partition lies in the formatted dataset."""
+        self.ensure_formatted()
+        metadata = json.loads((self.formatted_dir / METADATA_FILENAME).read_text())
+        return {name: range(*bounds) for name, bounds in metadata["partitions"].items()}
+
+    def labels(self) -> np.ndarray:
+        """Every sample's label, without reading the images."""
+        self.ensure_formatted()
+        return read_idx_labels(self.formatted_dir / LABELS_FILENAME)
 
     def is_cached(self, transform: Transform) -> bool:
         # A directory without metadata is an interrupted run and is never treated as cached
@@ -302,18 +387,8 @@ class SourceDataset:
             "transform": transform.name,
             "version": transform.version,
             "params": transform.params,
-            "samples": len(dataset),
-            "image_shape": list(dataset.images.shape[1:]),
-            "created": datetime.now(UTC).isoformat(timespec="seconds"),
         }
-        # Build the output beside the cache and swap it in, so an interrupted run never leaves a
-        # directory that looks complete (e.g. old metadata next to half-written images)
-        partial = directory.with_name(directory.name + PARTIAL_SUFFIX)
-        shutil.rmtree(partial, ignore_errors=True)
-        dataset.save(partial)
-        (partial / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
-        shutil.rmtree(directory, ignore_errors=True)
-        partial.rename(directory)
+        _save_with_metadata(directory, dataset, metadata)
         return dataset
 
     def cached_transforms(self) -> dict[str, dict]:
@@ -328,10 +403,13 @@ class SourceDataset:
 class MNIST(SourceDataset):
     name = "mnist"
     url = "https://www.kaggle.com/api/v1/datasets/download/hojjatk/mnist-dataset"
-    raw_files = (
-        ("train-images-idx3-ubyte/train-images-idx3-ubyte", "train-labels-idx1-ubyte/train-labels-idx1-ubyte"),
-        ("t10k-images-idx3-ubyte/t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte"),
-    )
+    raw_files: ClassVar[dict[str, tuple[str, str]]] = {
+        "train": (
+            "train-images-idx3-ubyte/train-images-idx3-ubyte",
+            "train-labels-idx1-ubyte/train-labels-idx1-ubyte",
+        ),
+        "test": ("t10k-images-idx3-ubyte/t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte/t10k-labels-idx1-ubyte"),
+    }
     checksums: ClassVar[dict[str, str]] = {
         "train-images-idx3-ubyte/train-images-idx3-ubyte": "ba891046e6505d7aadcbbe25680a0738ad16aec93bde7f9b65e87a2fc25776db",
         "train-labels-idx1-ubyte/train-labels-idx1-ubyte": "65a50cbbf4e906d70832878ad85ccda5333a97f0f4c3dd2ef09a8a9eef7101c5",
@@ -395,11 +473,146 @@ class Brightness(Transform):
         return Dataset(images=images, labels=dataset.labels.copy())
 
 
-def get_dataset(source: SourceDataset, *transforms: Transform, include_original: bool = True) -> Dataset:
-    """Compose the source dataset with each transform's output, generating any that aren't cached yet."""
-    original = source.prepare()
-    parts = [original] if include_original else []
-    parts += [source.transformed(transform) for transform in transforms]
-    if not parts:
-        return Dataset.empty(*original.images.shape[1:])
-    return Dataset.concatenate(parts)
+class Subset:
+    """Some of a source's samples, plus the augmented copies to add, read from disk only when load() is called.
+
+    Subsets are cheap descriptions, so splitting and transforming them costs nothing until you load. Split first,
+    then transform: split() and kfold() refuse a subset that already has transforms, so validation is always
+    held out from the original images and no augmented copy of a validation image can reach training.
+    """
+
+    def __init__(
+        self,
+        source: SourceDataset,
+        partition: str,
+        indices,
+        transforms: tuple[Transform, ...] = (),
+        include_original: bool = True,
+    ):
+        self.source = source
+        self.partition = partition
+        # Rows of the formatted source; sorted so a subset loads in source order however it was drawn
+        self.indices = np.sort(np.asarray(indices, dtype=np.int64))
+        self.indices.flags.writeable = False
+        self.transforms = tuple(transforms)
+        self.include_original = include_original
+
+    def __len__(self) -> int:
+        return len(self.indices) * (self.include_original + len(self.transforms))
+
+    def __repr__(self) -> str:
+        blocks = (["original"] if self.include_original else []) + [t.key for t in self.transforms]
+        return (
+            f"Subset({self.source.name}/{self.partition}, {len(self.indices)} images x [{', '.join(blocks)}]"
+            f" = {len(self)} samples)"
+        )
+
+    def _require_untransformed(self, operation: str):
+        if self.transforms or not self.include_original:
+            raise ValueError(
+                f"Cannot {operation} a transformed subset: {operation} first, then transform the training side,"
+                " so validation is held out from the original images only"
+            )
+
+    def transform(self, *transforms: Transform, include_original: bool = True) -> "Subset":
+        """Add one augmented copy of every image per transform. include_original=False drops the unmodified images."""
+        return Subset(
+            self.source,
+            self.partition,
+            self.indices,
+            self.transforms + transforms,
+            self.include_original and include_original,
+        )
+
+    def _order(self, seed: int, stratify: bool) -> np.ndarray:
+        """A seeded shuffle of positions in `indices`; stratified, any prefix has the subset's class balance."""
+        order = np.random.default_rng(seed).permutation(len(self.indices))
+        if not stratify:
+            return order
+        labels = self.source.labels()[self.indices[order]]
+        # Spread each class evenly through the order: key each image by its rank within its class as a fraction
+        # of the class size, so every contiguous run of the order takes the same share of each class
+        position = np.empty(len(order))
+        for label in np.unique(labels):
+            members = np.flatnonzero(labels == label)
+            position[members] = (np.arange(len(members)) + 0.5) / len(members)
+        return order[np.argsort(position, kind="stable")]
+
+    def split(self, validation: float | int, *, seed: int = 0, stratify: bool = True) -> tuple["Subset", "Subset"]:
+        """Hold out `validation` images (a count, or a fraction of the images) and return (train, validation).
+
+        Both sides are original images; transform the training side afterwards. Classes keep their proportions
+        on both sides unless stratify=False.
+        """
+        self._require_untransformed("split")
+        n = len(self.indices)
+        if isinstance(validation, float):
+            if not 0 < validation < 1:
+                raise ValueError(f"A validation fraction must be between 0 and 1, got {validation}")
+            validation = round(validation * n)
+        if not 0 < validation < n:
+            raise ValueError(f"Cannot hold out {validation} of {n} images: both sides need at least one")
+        order = self.indices[self._order(seed, stratify)]
+        return Subset(self.source, self.partition, order[validation:]), Subset(
+            self.source, self.partition, order[:validation]
+        )
+
+    def kfold(self, k: int, *, seed: int = 0, stratify: bool = True) -> list[tuple["Subset", "Subset"]]:
+        """k (train, validation) pairs whose validation sides partition the images, each of near-equal size.
+
+        Like split(), both sides are original images; transform each training side afterwards.
+        """
+        self._require_untransformed("kfold")
+        n = len(self.indices)
+        if not 2 <= k <= n:
+            raise ValueError(f"k must be between 2 and the number of images ({n}), got {k}")
+        # Contiguous runs of the stratified order, so each fold is balanced like a split's validation side
+        fold = np.empty(n, dtype=np.int64)
+        fold[self._order(seed, stratify)] = np.arange(n) * k // n
+        return [
+            (
+                Subset(self.source, self.partition, self.indices[fold != i]),
+                Subset(self.source, self.partition, self.indices[fold == i]),
+            )
+            for i in range(k)
+        ]
+
+    def load(self) -> Dataset:
+        """The selected originals, if included, followed by each transform's copies, generating any not cached."""
+        original = self.source.prepare()
+        parts = [original[self.indices]] if self.include_original else []
+        parts += [self.source.transformed(transform)[self.indices] for transform in self.transforms]
+        return Dataset.concatenate(parts) if parts else original[self.indices[:0]]
+
+    def describe(self) -> dict:
+        """Exactly which samples and augmentations this subset holds, as JSON-ready provenance."""
+        return {
+            "source": self.source.name,
+            "partition": self.partition,
+            "images": len(self.indices),
+            "indices_sha256": sha256(self.indices.astype("<i8").tobytes()).hexdigest(),
+            "include_original": self.include_original,
+            "transforms": [
+                {"key": t.key, "transform": t.name, "version": t.version, "params": t.params} for t in self.transforms
+            ],
+        }
+
+    def save(self, directory: Path) -> Dataset:
+        """Load and write the subset as IDX files with metadata.json, readable by Dataset.from_directory()."""
+        dataset = self.load()
+        _save_with_metadata(directory, dataset, self.describe())
+        return dataset
+
+
+class Partitions(NamedTuple):
+    train: Subset
+    test: Subset
+
+
+def get_dataset(source: SourceDataset) -> Partitions:
+    """The source's official (train, test) partitions, downloading and formatting it first if needed.
+
+    Split validation sets out of train. Keep test as it is: pretrained classifiers were trained on the official
+    train partition, so only the official test partition gives them a fair score.
+    """
+    return Partitions(**{name: Subset(source, name, rows) for name, rows in source.partitions().items()})

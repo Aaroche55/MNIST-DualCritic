@@ -32,8 +32,8 @@ def idx_labels_bytes(labels: np.ndarray) -> bytes:
     return struct.pack(">II", 2049, len(labels)) + labels.tobytes()
 
 
-TRAIN = make_split(seed=1, n=6)
-TEST = make_split(seed=2, n=4)
+TRAIN = make_split(seed=1, n=40)
+TEST = make_split(seed=2, n=10)
 RAW_FILES = {
     "train/images.idx3": idx_images_bytes(TRAIN[0]),
     "train/labels.idx1": idx_labels_bytes(TRAIN[1]),
@@ -45,7 +45,10 @@ RAW_FILES = {
 class FakeDataset(SourceDataset):
     name = "fake"
     url = "https://example.invalid/fake.zip"
-    raw_files = (("train/images.idx3", "train/labels.idx1"), ("test/images.idx3", "test/labels.idx1"))
+    raw_files: ClassVar[dict[str, tuple[str, str]]] = {
+        "train": ("train/images.idx3", "train/labels.idx1"),
+        "test": ("test/images.idx3", "test/labels.idx1"),
+    }
     checksums: ClassVar[dict[str, str]] = {path: sha256(content).hexdigest() for path, content in RAW_FILES.items()}
 
 
