@@ -12,6 +12,7 @@ and MLX NN only, trained from random initialisation, and sized for an M4 Mac wit
 | `classifier.py` | `DigitClassifier`: the pretrained MNIST classifier that scores generated samples, ported to MLX |
 | `score.py` | Score saved checkpoints with the classifier, CLI |
 | `images.py` | `make_grid` and `write_png` |
+| `plot.py` | Plot logged metrics to PNG, PDF or SVG, CLI |
 
 MLX is a project dependency, so `uv sync` installs it.
 
@@ -203,6 +204,47 @@ with more samples:
 uv run python -m generator.score --checkpoint outputs/checkpoints/ddpm/epoch-* --samples 16
 # -> rows tagged with "checkpoint" and "epoch" appended to outputs/metrics/scores.jsonl
 ```
+
+## Plots
+
+`plot.py` draws figures from the metrics files and writes them to `outputs/plots/` (or `-o`):
+
+```sh
+uv run python -m generator.plot --run ddpm                       # all panels -> outputs/plots/ddpm.png
+uv run python -m generator.plot --run ddpm -p loss -p confidence -o figures/ddpm.pdf
+uv run python -m generator.plot --run ddpm --separate --format svg   # one file per panel, for slides
+uv run python -m generator.plot --run ddpm --run ddpm-small -p accuracy   # compare runs on one panel
+uv run python -m generator.plot --run ddpm16+ddpm16-classifier   # a run joined with its resumed continuation
+uv run python -m generator.plot --run ddpm --list                # what can be plotted
+uv run python -m generator.plot --run ddpm -p digit-bars --separate   # a bar chart for every epoch
+uv run python -m generator.plot --run ddpm -p digit-bars --epoch 1 10 20 --columns 3   # chosen epochs side by side
+uv run python -m generator.plot --run ddpm -p digit-bars-stacked --epoch 5 15 25          # those epochs overlapped
+uv run python -m generator.plot --run ddpm -p digit-bars-stacked --bar-value confidence   # mean confidence instead
+```
+
+| Panel (`-p`) | Shows |
+| --- | --- |
+| `loss` | train and validation denoising loss per epoch |
+| `accuracy` | fraction of generated samples the classifier labels as the requested digit |
+| `confidence` | mean classifier confidence and probability of the requested digit, against real digits (0.91) |
+| `digit-accuracy` | accuracy for each digit, one line per digit |
+| `digit-confidence` | mean confidence for each digit |
+| `confusion` | requested digit against the classifier's guess, for each `--epoch` (default: the latest) |
+| `digit-bars` | bar chart per digit, one per `--epoch` (default: every scored epoch), with counts such as 14/16 and the previous scored epoch outlined |
+| `digit-bars-stacked` | the `--epoch` epochs (default: every scored epoch) overlapped on one bar chart, one colour per epoch |
+
+The bar charts show accuracy by default. `--bar-value confidence` shows the classifier's mean confidence in its
+guess, and `--bar-value target-probability` shows the mean probability it gives the requested digit. In
+`digit-bars-stacked`, each digit's bars are drawn tallest at the back and shortest at the front, so every epoch stays
+visible. Each bar further forward is slightly narrower, so an epoch that ties a later one (common with 16 samples
+per digit) still shows as a coloured rim. Up to ten epochs get distinct colours; more get a dark-to-light ramp
+from early to late.
+
+Any numeric key in `<run>.jsonl`, such as `best_validation_loss`, also works as a panel. With no `-p`, every panel
+except `digit-confidence` and the bar charts is drawn. Comparing several runs puts the per-epoch panels on shared axes and draws
+the per-digit panels once per run. Other options: `--columns` (2), `--size W H` (inches per panel), `--dpi` (200)
+and `--title`. The file type comes from `--format` or the extension of `-o`. PDF and SVG are vector formats and
+stay sharp in papers and slides.
 
 ## Sampling
 
