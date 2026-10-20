@@ -9,6 +9,9 @@ and MLX NN only, trained from random initialisation, and sized for an M4 Mac wit
 | `diffusion.py` | `GaussianDiffusion` and `DiffusionConfig`: noise schedule, forward noising, loss, sampling |
 | `training.py` | Data loading, training loop, validation loss, checkpoint save and load, CLI |
 | `sample.py` | Generate a PNG grid of one digit from a checkpoint, CLI |
+| `classifier.py` | `DigitClassifier`: the pretrained MNIST classifier that scores generated samples, ported to MLX |
+| `score.py` | Score saved checkpoints with the classifier, CLI |
+| `images.py` | `make_grid` and `write_png` |
 
 MLX is a project dependency, so `uv sync` installs it.
 
@@ -96,7 +99,15 @@ uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epo
 ```
 
 Other options: `--batch-size` (128), `--lr` (2e-4, Adam), `--seed` (0), `--base-channels` (64), `--timesteps`
-(1000) and `--output-dir` (`outputs`). Data options:
+(1000) and `--output-dir` (`outputs`). Saving and evaluation options:
+
+- `--save-every-epoch`: also keep each epoch's weights in `checkpoints/<run>/epoch-NNN/`, so any epoch can be
+  sampled later. These hold the model and `config.json` but not the optimiser state (about 15 MB each with the
+  default model), so resume from `last`, not from them;
+- `--classifier-samples` (16): images of each digit generated and scored by the pretrained classifier after
+  every epoch (see [Classifier evaluation](#classifier-evaluation)); `0` turns it off.
+
+Data options:
 
 - `--validation` (10000): images held out of the train partition, as a count or a fraction such as `0.2`;
 - `--split-seed` (0): which images are held out;
@@ -127,7 +138,11 @@ Outputs (`outputs/` is gitignored, so don't commit checkpoints or images):
 outputs/
     checkpoints/<run>/last/   model.safetensors, optimizer.safetensors, config.json   (written after every epoch)
     checkpoints/<run>/best/   the same, from the epoch with the lowest validation loss
-    metrics/<run>.jsonl       {"epoch", "step", "train_loss", "validation_loss", "best_validation_loss"} per epoch
+    checkpoints/<run>/epoch-NNN/   model.safetensors, config.json   (with --save-every-epoch)
+    metrics/<run>.jsonl       {"epoch", "step", "train_loss", "validation_loss", "best_validation_loss",
+                               "classifier_accuracy", ...} per epoch
+    metrics/<run>_classifier.jsonl   one row per generated sample per epoch (see below)
+    generated/<run>/epoch-NNN.png    the samples scored that epoch: one row per digit, 0 at the top
     generated/                PNG grids from sample.py
 ```
 
@@ -141,6 +156,53 @@ outputs/
 - the data settings (`data_config`);
 - for the train and validation sets (`data`): source, partition, image count, a hash of the selected image
   indices and the transforms applied, from `Subset.describe()`. Resuming checks this.
+
+## Classifier evaluation
+
+There is no discriminator. Sample quality is measured with an off-the-shelf MNIST classifier,
+[abdurafay19/Digit-Classifier](https://huggingface.co/abdurafay19/Digit-Classifier) (MIT; a 160 k-parameter CNN,
+99.43% on the MNIST test set). `classifier.py` re-implements its architecture in MLX and reads the PyTorch
+`model.pt` without PyTorch, through an unpickler that accepts only the names a plain state dict needs. The weights
+are pinned to one commit, checked against their SHA-256 and downloaded once into `.cache/digit-classifier/`
+(gitignored). The port's probabilities match the PyTorch model to within 1e-6.
+
+After every epoch, training generates `--classifier-samples` images of each digit from the same starting noise
+(fixed by `--seed`), so differences between epochs come from the model. It then classifies them. Each sample gives
+one row in `metrics/<run>_classifier.jsonl`:
+
+```json
+{"epoch": 3, "step": 4689, "target": 7, "sample": 0, "predicted": 7, "correct": true,
+ "confidence": 0.91, "target_probability": 0.91, "probabilities": [0.009, ..., 0.91, 0.01, 0.01]}
+```
+
+`target` is the requested digit, `sample` its index (0 to N−1), `predicted` the classifier's guess, `confidence`
+its probability and `target_probability` the probability it gives the requested digit. The epoch's summary goes into
+`metrics/<run>.jsonl` and the checkpoint's `config.json`: `classifier_accuracy`, `classifier_confidence` and
+`classifier_target_probability` (means over all samples), and `classifier_accuracy_per_digit` (ten values).
+With the default 16 per digit, evaluation adds about a minute per epoch on an M-series Mac, since sampling runs
+all T steps.
+
+The classifier was trained with label smoothing, so it is not confident even on real digits. On 2,000 real
+validation images it is 99% accurate with a mean confidence of 0.91. Compare against those figures, not 1.0.
+
+For plots, load the files with pandas:
+
+```python
+import pandas as pd
+
+epochs = pd.read_json("outputs/metrics/ddpm.jsonl", lines=True)
+samples = pd.read_json("outputs/metrics/ddpm_classifier.jsonl", lines=True)
+samples.groupby(["epoch", "target"]).correct.mean().unstack().plot()  # accuracy per digit over training
+pd.crosstab(samples.target, samples.predicted)  # confusion matrix
+```
+
+To score checkpoints that already exist, for example every epoch of a run saved with `--save-every-epoch`, or
+with more samples:
+
+```sh
+uv run python -m generator.score --checkpoint outputs/checkpoints/ddpm/epoch-* --samples 16
+# -> rows tagged with "checkpoint" and "epoch" appended to outputs/metrics/scores.jsonl
+```
 
 ## Sampling
 
@@ -163,7 +225,7 @@ than one training step.
 ## Tests
 
 ```sh
-uv run pytest tests/test_generator_smoke.py
+uv run pytest tests/test_generator_smoke.py tests/test_classifier.py
 ```
 
-The tests use only small random arrays and never read or download MNIST.
+The tests use only small random arrays and never read or download MNIST or the classifier weights.
