@@ -9,6 +9,10 @@ and MLX NN only, trained from random initialisation, and sized for an M4 Mac wit
 | `diffusion.py` | `GaussianDiffusion` and `DiffusionConfig`: noise schedule, forward noising, loss, sampling |
 | `training.py` | Data loading, training loop, validation loss, checkpoint save and load, CLI |
 | `sample.py` | Generate a PNG grid of one digit from a checkpoint, CLI |
+| `classifier.py` | `DigitClassifier`: the pretrained MNIST classifier that scores generated samples, ported to MLX |
+| `score.py` | Score saved checkpoints with the classifier, CLI |
+| `images.py` | `make_grid` and `write_png` |
+| `plot.py` | Plot logged metrics to PNG, PDF or SVG, CLI |
 
 MLX is a project dependency, so `uv sync` installs it.
 
@@ -96,7 +100,15 @@ uv run python -m generator.training --resume outputs/checkpoints/ddpm/last --epo
 ```
 
 Other options: `--batch-size` (128), `--lr` (2e-4, Adam), `--seed` (0), `--base-channels` (64), `--timesteps`
-(1000) and `--output-dir` (`outputs`). Data options:
+(1000) and `--output-dir` (`outputs`). Saving and evaluation options:
+
+- `--save-every-epoch`: also keep each epoch's weights in `checkpoints/<run>/epoch-NNN/`, so any epoch can be
+  sampled later. These hold the model and `config.json` but not the optimiser state (about 15 MB each with the
+  default model), so resume from `last`, not from them;
+- `--classifier-samples` (16): images of each digit generated and scored by the pretrained classifier after
+  every epoch (see [Classifier evaluation](#classifier-evaluation)); `0` turns it off.
+
+Data options:
 
 - `--validation` (10000): images held out of the train partition, as a count or a fraction such as `0.2`;
 - `--split-seed` (0): which images are held out;
@@ -127,7 +139,11 @@ Outputs (`outputs/` is gitignored, so don't commit checkpoints or images):
 outputs/
     checkpoints/<run>/last/   model.safetensors, optimizer.safetensors, config.json   (written after every epoch)
     checkpoints/<run>/best/   the same, from the epoch with the lowest validation loss
-    metrics/<run>.jsonl       {"epoch", "step", "train_loss", "validation_loss", "best_validation_loss"} per epoch
+    checkpoints/<run>/epoch-NNN/   model.safetensors, config.json   (with --save-every-epoch)
+    metrics/<run>.jsonl       {"epoch", "step", "train_loss", "validation_loss", "best_validation_loss",
+                               "classifier_accuracy", ...} per epoch
+    metrics/<run>_classifier.jsonl   one row per generated sample per epoch (see below)
+    generated/<run>/epoch-NNN.png    the samples scored that epoch: one row per digit, 0 at the top
     generated/                PNG grids from sample.py
 ```
 
@@ -141,6 +157,94 @@ outputs/
 - the data settings (`data_config`);
 - for the train and validation sets (`data`): source, partition, image count, a hash of the selected image
   indices and the transforms applied, from `Subset.describe()`. Resuming checks this.
+
+## Classifier evaluation
+
+There is no discriminator. Sample quality is measured with an off-the-shelf MNIST classifier,
+[abdurafay19/Digit-Classifier](https://huggingface.co/abdurafay19/Digit-Classifier) (MIT; a 160 k-parameter CNN,
+99.43% on the MNIST test set). `classifier.py` re-implements its architecture in MLX and reads the PyTorch
+`model.pt` without PyTorch, through an unpickler that accepts only the names a plain state dict needs. The weights
+are pinned to one commit, checked against their SHA-256 and downloaded once into `.cache/digit-classifier/`
+(gitignored). The port's probabilities match the PyTorch model to within 1e-6.
+
+After every epoch, training generates `--classifier-samples` images of each digit from the same starting noise
+(fixed by `--seed`), so differences between epochs come from the model. It then classifies them. Each sample gives
+one row in `metrics/<run>_classifier.jsonl`:
+
+```json
+{"epoch": 3, "step": 4689, "target": 7, "sample": 0, "predicted": 7, "correct": true,
+ "confidence": 0.91, "target_probability": 0.91, "probabilities": [0.009, ..., 0.91, 0.01, 0.01]}
+```
+
+`target` is the requested digit, `sample` its index (0 to N−1), `predicted` the classifier's guess, `confidence`
+its probability and `target_probability` the probability it gives the requested digit. The epoch's summary goes into
+`metrics/<run>.jsonl` and the checkpoint's `config.json`: `classifier_accuracy`, `classifier_confidence` and
+`classifier_target_probability` (means over all samples), and `classifier_accuracy_per_digit` (ten values).
+With the default 16 per digit, evaluation adds about a minute per epoch on an M-series Mac, since sampling runs
+all T steps.
+
+The classifier was trained with label smoothing, so it is not confident even on real digits. On 2,000 real
+validation images it is 99% accurate with a mean confidence of 0.91. Compare against those figures, not 1.0.
+
+For plots, load the files with pandas:
+
+```python
+import pandas as pd
+
+epochs = pd.read_json("outputs/metrics/ddpm.jsonl", lines=True)
+samples = pd.read_json("outputs/metrics/ddpm_classifier.jsonl", lines=True)
+samples.groupby(["epoch", "target"]).correct.mean().unstack().plot()  # accuracy per digit over training
+pd.crosstab(samples.target, samples.predicted)  # confusion matrix
+```
+
+To score checkpoints that already exist, for example every epoch of a run saved with `--save-every-epoch`, or
+with more samples:
+
+```sh
+uv run python -m generator.score --checkpoint outputs/checkpoints/ddpm/epoch-* --samples 16
+# -> rows tagged with "checkpoint" and "epoch" appended to outputs/metrics/scores.jsonl
+```
+
+## Plots
+
+`plot.py` draws figures from the metrics files and writes them to `outputs/plots/` (or `-o`):
+
+```sh
+uv run python -m generator.plot --run ddpm                       # all panels -> outputs/plots/ddpm.png
+uv run python -m generator.plot --run ddpm -p loss -p confidence -o figures/ddpm.pdf
+uv run python -m generator.plot --run ddpm --separate --format svg   # one file per panel, for slides
+uv run python -m generator.plot --run ddpm --run ddpm-small -p accuracy   # compare runs on one panel
+uv run python -m generator.plot --run ddpm16+ddpm16-classifier   # a run joined with its resumed continuation
+uv run python -m generator.plot --run ddpm --list                # what can be plotted
+uv run python -m generator.plot --run ddpm -p digit-bars --separate   # a bar chart for every epoch
+uv run python -m generator.plot --run ddpm -p digit-bars --epoch 1 10 20 --columns 3   # chosen epochs side by side
+uv run python -m generator.plot --run ddpm -p digit-bars-grouped --epoch 5 15 25          # those epochs side by side
+uv run python -m generator.plot --run ddpm -p digit-bars-grouped --bar-value confidence   # mean confidence instead
+```
+
+| Panel (`-p`) | Shows |
+| --- | --- |
+| `loss` | train and validation denoising loss per epoch |
+| `accuracy` | fraction of generated samples the classifier labels as the requested digit |
+| `confidence` | mean classifier confidence and probability of the requested digit, against real digits (0.91) |
+| `digit-accuracy` | accuracy for each digit, one line per digit |
+| `digit-confidence` | mean confidence for each digit |
+| `digit-accuracy-map`, `digit-confidence-map` | the same as a heatmap, digits down and epochs across; easier to read than ten lines once a run has many epochs |
+| `confusion` | requested digit against the classifier's guess, for each `--epoch` (default: the latest) |
+| `digit-bars` | bar chart per digit, one per `--epoch` (default: every scored epoch), with counts such as 14/16 and the previous scored epoch outlined |
+| `digit-bars-grouped` | the `--epoch` epochs (default: every scored epoch) side by side for each digit, shaded dark (early) to light (late) |
+
+The bar charts show accuracy by default. `--bar-value confidence` shows the classifier's mean confidence in its
+guess, and `--bar-value target-probability` shows the mean probability it gives the requested digit. In
+`digit-bars-grouped`, each digit gets a group of thin, equal-width bars, one per epoch in order, so nothing
+overlaps. Choose a handful of epochs; dozens make the bars too thin to read. Colour follows time: a ramp from dark purple for the earliest chosen epoch
+to yellow-green for the latest, evenly spaced by order.
+
+Any numeric key in `<run>.jsonl`, such as `best_validation_loss`, also works as a panel. With no `-p`, every panel
+except `digit-confidence`, the heatmaps and the bar charts is drawn. Each line has its own colour (validation and the requested-digit probability are also dashed, for greyscale print), and past 30 epochs the per-epoch dots are dropped so long runs stay readable. Comparing several runs puts the per-epoch panels on shared axes and draws
+the per-digit panels once per run. Other options: `--columns` (2), `--size W H` (inches per panel), `--dpi` (200)
+and `--title`. The file type comes from `--format` or the extension of `-o`. PDF and SVG are vector formats and
+stay sharp in papers and slides.
 
 ## Sampling
 
@@ -163,7 +267,7 @@ than one training step.
 ## Tests
 
 ```sh
-uv run pytest tests/test_generator_smoke.py
+uv run pytest tests/test_generator_smoke.py tests/test_classifier.py
 ```
 
-The tests use only small random arrays and never read or download MNIST.
+The tests use only small random arrays and never read or download MNIST or the classifier weights.

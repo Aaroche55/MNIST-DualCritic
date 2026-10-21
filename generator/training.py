@@ -14,7 +14,13 @@ there. Outputs::
 
     outputs/checkpoints/<run>/last/   model.safetensors, optimizer.safetensors, config.json (after every epoch)
     outputs/checkpoints/<run>/best/   the same, for the epoch with the lowest validation loss so far
-    outputs/metrics/<run>.jsonl       one line per epoch: train and validation loss
+    outputs/checkpoints/<run>/epoch-NNN/   model.safetensors and config.json for every epoch (--save-every-epoch)
+    outputs/metrics/<run>.jsonl       one line per epoch: train and validation loss, classifier summary
+    outputs/metrics/<run>_classifier.jsonl   one line per generated sample: requested digit, guess, probabilities
+    outputs/generated/<run>/epoch-NNN.png    the samples the classifier scored, one row per digit
+
+After each epoch, --classifier-samples images of each digit (16 by default) are generated with the same seed and
+scored by the pretrained classifier in generator.classifier, so epochs can be compared and plotted.
 """
 
 import argparse
@@ -31,7 +37,9 @@ import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
+from generator.classifier import DigitClassifier, classify, load_classifier
 from generator.diffusion import DiffusionConfig, GaussianDiffusion
+from generator.images import make_grid, write_png
 from generator.model import ConditionalUNet, ModelConfig
 from mnist_dualcritic.cli import count_or_fraction
 from mnist_dualcritic.data import (
@@ -71,6 +79,8 @@ class TrainConfig:
     adam_eps: float = 1e-8
     run_name: str = "ddpm"
     output_dir: str = str(OUTPUT_DIR)
+    save_every_epoch: bool = False  # also keep each epoch's weights in checkpoints/<run>/epoch-NNN/
+    classifier_samples: int = 16  # samples per digit scored by the pretrained classifier each epoch; 0 disables
 
 
 @dataclass(frozen=True)
@@ -174,6 +184,53 @@ def evaluate(model: ConditionalUNet, diffusion: GaussianDiffusion, dataset: Data
     return total / len(dataset)
 
 
+def classifier_scores(
+    model: ConditionalUNet, diffusion: GaussianDiffusion, classifier: DigitClassifier, per_class: int, seed: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generate `per_class` images of every digit and classify them: (images uint8, labels, probabilities (N, 10)).
+
+    The sampling noise is fixed by `seed`, so successive epochs are scored on the same starting noise.
+    """
+    num_classes, size, channels = model.config.num_classes, model.config.image_size, model.config.image_channels
+    labels = np.repeat(np.arange(num_classes, dtype=np.int32), per_class)
+    x = diffusion.sample(model, mx.array(labels), mx.random.key(derived_seed(seed, 3)), (size, size, channels))
+    images = denormalise(x)
+    return images, labels, classify(classifier, images)
+
+
+def classifier_records(labels: np.ndarray, probabilities: np.ndarray) -> list[dict]:
+    """One JSON-ready row per sample: the requested digit, the classifier's guess and its confidence."""
+    records, seen = [], {}
+    for target, probs in zip(labels.tolist(), probabilities, strict=True):
+        predicted = int(probs.argmax())
+        records.append(
+            {
+                "target": target,
+                "sample": seen.setdefault(target, 0),
+                "predicted": predicted,
+                "correct": predicted == target,
+                "confidence": float(probs[predicted]),
+                "target_probability": float(probs[target]),
+                "probabilities": [round(float(p), 6) for p in probs],
+            }
+        )
+        seen[target] += 1
+    return records
+
+
+def classifier_summary(labels: np.ndarray, probabilities: np.ndarray) -> dict:
+    """Accuracy and mean confidences over all samples, plus accuracy for each requested digit."""
+    correct = probabilities.argmax(axis=1) == labels
+    return {
+        "classifier_accuracy": float(correct.mean()),
+        "classifier_confidence": float(probabilities.max(axis=1).mean()),
+        "classifier_target_probability": float(probabilities[np.arange(len(labels)), labels].mean()),
+        "classifier_accuracy_per_digit": [
+            float(correct[labels == d].mean()) if (labels == d).any() else None for d in range(probabilities.shape[1])
+        ],
+    }
+
+
 def checkpoint_config(
     train_config: TrainConfig,
     model_config: ModelConfig,
@@ -202,15 +259,16 @@ def checkpoint_config(
     }
 
 
-def save_checkpoint(directory: Path, model: ConditionalUNet, optimizer: optim.Optimizer, config: dict):
-    """Write weights, optimiser state and config.json, swapping the directory in only once all three exist."""
+def save_checkpoint(directory: Path, model: ConditionalUNet, optimizer: optim.Optimizer | None, config: dict):
+    """Write weights, optimiser state (unless None) and config.json, swapping the directory in once all exist."""
     directory = Path(directory)
     ensure_outside_data(directory)
     partial = directory.with_name(directory.name + ".partial")
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(parents=True)
     model.save_weights(str(partial / MODEL_FILENAME))
-    mx.save_safetensors(str(partial / OPTIMIZER_FILENAME), dict(tree_flatten(optimizer.state)))
+    if optimizer is not None:
+        mx.save_safetensors(str(partial / OPTIMIZER_FILENAME), dict(tree_flatten(optimizer.state)))
     (partial / CONFIG_FILENAME).write_text(json.dumps(config, indent=2) + "\n")
     shutil.rmtree(directory, ignore_errors=True)
     partial.rename(directory)
@@ -240,8 +298,11 @@ def train(
     """Train, saving `last` and `best` checkpoints every epoch; returns the run's checkpoint directory."""
     run_dir = Path(config.output_dir) / "checkpoints" / config.run_name
     metrics_path = Path(config.output_dir) / "metrics" / f"{config.run_name}.jsonl"
-    for path in (run_dir, metrics_path):
+    scores_path = Path(config.output_dir) / "metrics" / f"{config.run_name}_classifier.jsonl"
+    samples_dir = Path(config.output_dir) / "generated" / config.run_name
+    for path in (run_dir, metrics_path, scores_path, samples_dir):
         ensure_outside_data(path)
+    classifier = load_classifier() if config.classifier_samples > 0 else None
 
     train_subset, validation_subset = load_data(data_config)
     data = data_record(train_subset, validation_subset)
@@ -293,16 +354,34 @@ def train(
             "validation_loss": validation_loss,
             "best_validation_loss": best_loss,
         }
+        summary = ""
+        if classifier is not None:
+            images, labels, probabilities = classifier_scores(
+                model, diffusion, classifier, config.classifier_samples, config.seed
+            )
+            metrics |= classifier_summary(labels, probabilities)
+            with scores_path.open("a") as file:
+                for record in classifier_records(labels, probabilities):
+                    file.write(json.dumps({"epoch": epoch + 1, "step": step} | record) + "\n")
+            samples_dir.mkdir(parents=True, exist_ok=True)
+            write_png(samples_dir / f"epoch-{epoch + 1:03d}.png", make_grid(images, columns=config.classifier_samples))
+            summary = (
+                f", classifier accuracy {metrics['classifier_accuracy']:.3f}"
+                f" confidence {metrics['classifier_confidence']:.3f}"
+            )
         with metrics_path.open("a") as file:
             file.write(json.dumps({"epoch": epoch + 1, "step": step} | metrics) + "\n")
         print(
             f"epoch {epoch + 1}: train {train_loss:.4f}, validation {validation_loss:.4f}{' (best)' if improved else ''}"
+            + summary
         )
 
         saved = checkpoint_config(config, model_config, diffusion_config, data_config, data, epoch + 1, step, metrics)
         save_checkpoint(run_dir / "last", model, optimizer, saved)
         if improved:
             save_checkpoint(run_dir / "best", model, optimizer, saved)
+        if config.save_every_epoch:
+            save_checkpoint(run_dir / f"epoch-{epoch + 1:03d}", model, None, saved)  # weights only: for sampling
     return run_dir
 
 
@@ -323,6 +402,18 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--base-channels", type=int, default=model_defaults.base_channels)
     parser.add_argument("--timesteps", type=int, default=diffusion_defaults.num_timesteps)
     parser.add_argument("--resume", type=Path, help="checkpoint directory to continue from, e.g. .../last")
+    parser.add_argument(
+        "--save-every-epoch",
+        action="store_true",
+        help="also keep every epoch's weights in checkpoints/<run>/epoch-NNN/ (for sampling later; cannot resume)",
+    )
+    parser.add_argument(
+        "--classifier-samples",
+        type=int,
+        default=defaults.classifier_samples,
+        help="images of each digit generated and scored by the pretrained classifier after every epoch;"
+        " 0 disables (default: %(default)s)",
+    )
     data = parser.add_argument_group("data")
     data.add_argument("--data-dir", default=data_defaults.data_dir)
     data.add_argument(
@@ -342,6 +433,8 @@ def main(argv: list[str] | None = None):
     )
     data.add_argument("--no-augment", action="store_true", help="train on the original images only")
     args = parser.parse_args(argv)
+    if args.classifier_samples < 0:
+        parser.error("--classifier-samples must be at least 0")
     if args.no_augment and args.transform:
         parser.error("--no-augment and --transform cannot be combined")
     if args.no_augment:
@@ -360,6 +453,8 @@ def main(argv: list[str] | None = None):
         learning_rate=args.lr,
         run_name=args.run_name,
         output_dir=args.output_dir,
+        save_every_epoch=args.save_every_epoch,
+        classifier_samples=args.classifier_samples,
     )
     train(
         config,
