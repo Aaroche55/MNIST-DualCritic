@@ -20,6 +20,7 @@ output's extension: png, pdf, svg.
 
 import argparse
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -86,22 +87,33 @@ def colours(runs: list[Run]) -> dict[str, str]:
     return {run.name: f"C{i}" for i, run in enumerate(runs)}
 
 
+# Above this many epochs the markers merge into a thick smear, so lines are drawn plain
+MARKER_LIMIT = 30
+
+
+def line_style(runs: list[Run], key: str = "validation_loss") -> dict:
+    """Markers on each epoch for short runs; thin plain lines once there are too many epochs to tell dots apart."""
+    longest = max((len(run.series(key)[0]) for run in runs), default=0)
+    return {"marker": "o", "markersize": 3} if longest <= MARKER_LIMIT else {"linewidth": 1.2}
+
+
 def plot_loss(ax, runs: list[Run], **_):
-    colour = colours(runs)
-    for run in runs:
-        for key, style, label in (("train_loss", "-", "train"), ("validation_loss", "--", "validation")):
+    style = line_style(runs)
+    for i, run in enumerate(runs):
+        # Each line its own colour; the dash also marks validation, for greyscale prints
+        for j, (key, dash, label) in enumerate((("train_loss", "-", "train"), ("validation_loss", "--", "validation"))):
             x, y = run.series(key)
             name = f"{run.name} {label}" if len(runs) > 1 else label
-            ax.plot(x, y, style, marker="o", markersize=3, color=colour[run.name], label=name)
+            ax.plot(x, y, dash, color=f"C{2 * i + j}", label=name, **style)
     ax.set_title("Denoising loss")
     epoch_axis(ax, "MSE")
     ax.legend()
 
 
 def plot_accuracy(ax, runs: list[Run], **_):
-    colour = colours(runs)
+    colour, style = colours(runs), line_style(runs, "classifier_accuracy")
     for run in runs:
-        ax.plot(*run.series("classifier_accuracy"), marker="o", markersize=3, color=colour[run.name], label=run.name)
+        ax.plot(*run.series("classifier_accuracy"), color=colour[run.name], label=run.name, **style)
     ax.set_title("Classifier accuracy on generated digits")
     epoch_axis(ax, "fraction classified as the requested digit")
     ax.set_ylim(0, 1.02)
@@ -109,16 +121,15 @@ def plot_accuracy(ax, runs: list[Run], **_):
 
 
 def plot_confidence(ax, runs: list[Run], **_):
-    colour = colours(runs)
-    for run in runs:
+    style = line_style(runs, "classifier_confidence")
+    for i, run in enumerate(runs):
         prefix = f"{run.name} " if len(runs) > 1 else ""
         ax.plot(
-            *run.series("classifier_confidence"), marker="o", markersize=3, color=colour[run.name],
-            label=f"{prefix}confidence (top class)",
-        )  # fmt: skip
+            *run.series("classifier_confidence"), color=f"C{2 * i}", label=f"{prefix}confidence (top class)", **style
+        )
         ax.plot(
-            *run.series("classifier_target_probability"), "--", marker="o", markersize=3, color=colour[run.name],
-            label=f"{prefix}probability of requested digit",
+            *run.series("classifier_target_probability"), "--", color=f"C{2 * i + 1}",
+            label=f"{prefix}probability of requested digit", **style,
         )  # fmt: skip
     ax.axhline(REAL_DIGIT_CONFIDENCE, color="grey", linestyle=":", label=f"real MNIST digits ({REAL_DIGIT_CONFIDENCE})")
     ax.set_title("Classifier confidence on generated digits")
@@ -129,23 +140,66 @@ def plot_confidence(ax, runs: list[Run], **_):
 
 def per_digit(ax, run: Run, value, title: str, ylabel: str):
     """One line per digit of value(samples of that digit) over the epochs that were scored."""
-    epochs = run.sample_epochs()
+    epochs, grid = digit_grid(run, value)
     cmap = plt.get_cmap("tab10")
+    style = {"marker": "o", "markersize": 3} if len(epochs) <= MARKER_LIMIT else {"linewidth": 1}
     for digit in DIGITS:
-        y = [value([s for s in run.samples if s["epoch"] == e and s["target"] == digit]) for e in epochs]
-        ax.plot(epochs, y, marker="o", markersize=3, color=cmap(digit), label=str(digit))
+        ax.plot(epochs, grid[digit], color=cmap(digit), label=str(digit), **style)
     ax.set_title(f"{title} ({run.name})")
     epoch_axis(ax, ylabel)
     ax.set_ylim(0, 1.02)
     ax.legend(title="digit", ncol=2, fontsize="small")
 
 
+def digit_grid(run: Run, value) -> tuple[list[int], np.ndarray]:
+    """Scored epochs, and value(samples) for each (digit, epoch) as a (10, epochs) array (NaN where none)."""
+    epochs = run.sample_epochs()
+    grid = np.full((len(DIGITS), len(epochs)), np.nan)
+    for j, epoch in enumerate(epochs):
+        rows = [s for s in run.samples if s["epoch"] == epoch]
+        for digit in DIGITS:
+            if chosen := [s for s in rows if s["target"] == digit]:
+                grid[digit, j] = value(chosen)
+    return epochs, grid
+
+
+def digit_map(ax, run: Run, value, title: str, label: str):
+    """Digits down, epochs across, coloured by value: readable however many epochs there are."""
+    epochs, grid = digit_grid(run, value)
+    image = ax.imshow(
+        grid, aspect="auto", cmap="viridis", vmin=0, vmax=1, interpolation="nearest",
+        extent=(epochs[0] - 0.5, epochs[-1] + 0.5, len(DIGITS) - 0.5, -0.5),
+    )  # fmt: skip
+    ax.figure.colorbar(image, ax=ax, label=label)
+    ax.set_yticks(DIGITS)
+    ax.set_ylabel("requested digit")
+    ax.set_xlabel("epoch")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_title(f"{title} ({run.name})")
+
+
+def mean_correct(samples):
+    return np.mean([r["correct"] for r in samples])
+
+
+def mean_confidence(samples):
+    return np.mean([r["confidence"] for r in samples])
+
+
 def plot_digit_accuracy(ax, run: Run, **_):
-    per_digit(ax, run, lambda s: np.mean([r["correct"] for r in s]), "Accuracy per digit", "fraction correct")
+    per_digit(ax, run, mean_correct, "Accuracy per digit", "fraction correct")
 
 
 def plot_digit_confidence(ax, run: Run, **_):
-    per_digit(ax, run, lambda s: np.mean([r["confidence"] for r in s]), "Confidence per digit", "mean probability")
+    per_digit(ax, run, mean_confidence, "Confidence per digit", "mean probability")
+
+
+def plot_digit_accuracy_map(ax, run: Run, **_):
+    digit_map(ax, run, mean_correct, "Accuracy per digit", "fraction correct")
+
+
+def plot_digit_confidence_map(ax, run: Run, **_):
+    digit_map(ax, run, mean_confidence, "Confidence per digit", "mean confidence")
 
 
 def epoch_samples(run: Run, epoch: int) -> list[dict]:
@@ -207,15 +261,17 @@ def plot_digit_bars(ax, run: Run, epoch: int, value: str = "accuracy", **_):
 
 
 def epoch_colours(epochs: list[int]) -> dict[int, tuple]:
-    """A distinct colour per epoch: tab10 for up to ten, otherwise a viridis ramp from early (dark) to late."""
-    if len(epochs) <= 10:
-        return {e: plt.get_cmap("tab10")(i) for i, e in enumerate(epochs)}
-    ramp = plt.get_cmap("viridis")(np.linspace(0, 0.95, len(epochs)))
-    return {e: tuple(c) for e, c in zip(epochs, ramp, strict=True)}
+    """Colour follows time: a viridis ramp from dark purple (earliest chosen epoch) to yellow-green (latest).
+
+    Epochs are spaced evenly along the ramp by their order, not their number, so 1, 2, 3, 5, 120 still get
+    clearly different shades. The palest end of viridis is left out so the last epoch stays visible on white.
+    """
+    ramp = plt.get_cmap("viridis")(np.linspace(0, 0.85, len(epochs)) if len(epochs) > 1 else [0.45])
+    return {e: tuple(c) for e, c in zip(sorted(epochs), ramp, strict=True)}
 
 
 def plot_digit_bars_stacked(ax, run: Run, epochs: list[int], value: str = "accuracy", **_):
-    """Several epochs overlapped on one bar chart, each its own colour. For every digit the tallest bar is drawn at
+    """Several epochs overlapped on one bar chart, coloured dark (early) to light (late). For every digit the tallest bar is drawn at
     the back and the shortest at the front, so each epoch's height stays visible; each bar further forward is a
     little narrower, so an epoch tied with a later one still shows as a coloured rim."""
     key = BAR_VALUES[value][0]
@@ -256,7 +312,7 @@ def plot_confusion(ax, run: Run, epoch: int, **_):
 def plot_metric(ax, runs: list[Run], key: str, **_):
     colour = colours(runs)
     for run in runs:
-        ax.plot(*run.series(key), marker="o", markersize=3, color=colour[run.name], label=run.name)
+        ax.plot(*run.series(key), color=colour[run.name], label=run.name, **line_style(runs, key))
     ax.set_title(key)
     epoch_axis(ax, key)
     ax.legend()
@@ -271,6 +327,8 @@ PANELS = {
     "confidence": (plot_confidence, "epochs", "mean classifier confidence and probability of the requested digit"),
     "digit-accuracy": (plot_digit_accuracy, "samples", "accuracy for each digit, one line per digit"),
     "digit-confidence": (plot_digit_confidence, "samples", "mean confidence for each digit"),
+    "digit-accuracy-map": (plot_digit_accuracy_map, "samples", "accuracy as a digit-by-epoch heatmap (long runs)"),
+    "digit-confidence-map": (plot_digit_confidence_map, "samples", "mean confidence as a digit-by-epoch heatmap"),
     "confusion": (plot_confusion, "latest", "requested digit against the classifier's guess, per --epoch"),
     "digit-bars": (plot_digit_bars, "each", "bar chart per digit (--bar-value), one per epoch (or per --epoch)"),
     "digit-bars-stacked": (
@@ -370,7 +428,7 @@ def main(argv: list[str] | None = None):
     runs = [load_run(spec, args.metrics_dir) for spec in args.run]
     if args.list:
         for name, (_, _, help_text) in PANELS.items():
-            print(f"{name:18} {help_text}")
+            print(f"{name:20} {help_text}")
         print("\nper-epoch metric keys:", ", ".join(sorted({k for run in runs for k in run.numeric_keys()})))
         return
 
@@ -389,6 +447,8 @@ def main(argv: list[str] | None = None):
     figures = [(f"-{suffix}", [(suffix, draw)]) for suffix, draw in panels] if args.separate else [("", panels)]
     for suffix, group in figures:
         fig = figure(group, args.columns, tuple(args.size), args.title)
+        if re.fullmatch(rf"-{re.escape(output.stem)}(-e\d+)?", suffix):  # -o confusion.png -> confusion-e010.png
+            suffix = suffix[len(output.stem) + 1 :]
         path = output.with_name(f"{output.stem}{suffix}{output.suffix}")
         fig.savefig(path, dpi=args.dpi)
         plt.close(fig)

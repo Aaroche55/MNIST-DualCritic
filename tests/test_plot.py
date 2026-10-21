@@ -97,3 +97,18 @@ def test_stacked_bars_use_the_chosen_epochs(metrics_dir, tmp_path):
     assert "epochs 2, 3" in output.read_text()
     with pytest.raises(SystemExit, match="no classifier samples for epoch 1"):
         main([*args, "--epoch", "1", "3"])
+
+
+def test_panel_named_output_is_not_repeated_in_file_names(metrics_dir, tmp_path):
+    output = str(tmp_path / "confusion.png")
+    main(["--run", "b", "--metrics-dir", str(metrics_dir), "-o", output, "-p", "confusion", "--epoch", "2", "3"])
+    main(["--run", "b", "--metrics-dir", str(metrics_dir), "-o", output, "-p", "confusion", "--separate"])
+    names = sorted(p.name for p in tmp_path.glob("confusion*.png"))
+    assert names == ["confusion-e003.png", "confusion.png"]  # the combined figure, then the latest epoch on its own
+
+
+@pytest.mark.parametrize("panel", ["digit-accuracy-map", "digit-confidence-map"])
+def test_digit_maps(metrics_dir, tmp_path, panel):
+    output = tmp_path / f"{panel}.svg"
+    main(["--run", "b", "--metrics-dir", str(metrics_dir), "-o", str(output), "-p", panel])
+    assert output.stat().st_size > 0

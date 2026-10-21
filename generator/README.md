@@ -229,19 +229,20 @@ uv run python -m generator.plot --run ddpm -p digit-bars-stacked --bar-value con
 | `confidence` | mean classifier confidence and probability of the requested digit, against real digits (0.91) |
 | `digit-accuracy` | accuracy for each digit, one line per digit |
 | `digit-confidence` | mean confidence for each digit |
+| `digit-accuracy-map`, `digit-confidence-map` | the same as a heatmap, digits down and epochs across; easier to read than ten lines once a run has many epochs |
 | `confusion` | requested digit against the classifier's guess, for each `--epoch` (default: the latest) |
 | `digit-bars` | bar chart per digit, one per `--epoch` (default: every scored epoch), with counts such as 14/16 and the previous scored epoch outlined |
-| `digit-bars-stacked` | the `--epoch` epochs (default: every scored epoch) overlapped on one bar chart, one colour per epoch |
+| `digit-bars-stacked` | the `--epoch` epochs (default: every scored epoch) overlapped on one bar chart, shaded dark (early) to light (late) |
 
 The bar charts show accuracy by default. `--bar-value confidence` shows the classifier's mean confidence in its
 guess, and `--bar-value target-probability` shows the mean probability it gives the requested digit. In
 `digit-bars-stacked`, each digit's bars are drawn tallest at the back and shortest at the front, so every epoch stays
 visible. Each bar further forward is slightly narrower, so an epoch that ties a later one (common with 16 samples
-per digit) still shows as a coloured rim. Up to ten epochs get distinct colours; more get a dark-to-light ramp
-from early to late.
+per digit) still shows as a coloured rim. Colour follows time: a ramp from dark purple for the earliest chosen epoch
+to yellow-green for the latest, evenly spaced by order.
 
 Any numeric key in `<run>.jsonl`, such as `best_validation_loss`, also works as a panel. With no `-p`, every panel
-except `digit-confidence` and the bar charts is drawn. Comparing several runs puts the per-epoch panels on shared axes and draws
+except `digit-confidence`, the heatmaps and the bar charts is drawn. Each line has its own colour (validation and the requested-digit probability are also dashed, for greyscale print), and past 30 epochs the per-epoch dots are dropped so long runs stay readable. Comparing several runs puts the per-epoch panels on shared axes and draws
 the per-digit panels once per run. Other options: `--columns` (2), `--size W H` (inches per panel), `--dpi` (200)
 and `--title`. The file type comes from `--format` or the extension of `-o`. PDF and SVG are vector formats and
 stay sharp in papers and slides.
