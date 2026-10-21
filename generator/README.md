@@ -218,8 +218,8 @@ uv run python -m generator.plot --run ddpm16+ddpm16-classifier   # a run joined 
 uv run python -m generator.plot --run ddpm --list                # what can be plotted
 uv run python -m generator.plot --run ddpm -p digit-bars --separate   # a bar chart for every epoch
 uv run python -m generator.plot --run ddpm -p digit-bars --epoch 1 10 20 --columns 3   # chosen epochs side by side
-uv run python -m generator.plot --run ddpm -p digit-bars-stacked --epoch 5 15 25          # those epochs overlapped
-uv run python -m generator.plot --run ddpm -p digit-bars-stacked --bar-value confidence   # mean confidence instead
+uv run python -m generator.plot --run ddpm -p digit-bars-grouped --epoch 5 15 25          # those epochs side by side
+uv run python -m generator.plot --run ddpm -p digit-bars-grouped --bar-value confidence   # mean confidence instead
 ```
 
 | Panel (`-p`) | Shows |
@@ -232,14 +232,12 @@ uv run python -m generator.plot --run ddpm -p digit-bars-stacked --bar-value con
 | `digit-accuracy-map`, `digit-confidence-map` | the same as a heatmap, digits down and epochs across; easier to read than ten lines once a run has many epochs |
 | `confusion` | requested digit against the classifier's guess, for each `--epoch` (default: the latest) |
 | `digit-bars` | bar chart per digit, one per `--epoch` (default: every scored epoch), with counts such as 14/16 and the previous scored epoch outlined |
-| `digit-bars-stacked` | the `--epoch` epochs (default: every scored epoch) overlapped on one bar chart, shaded dark (early) to light (late) |
+| `digit-bars-grouped` | the `--epoch` epochs (default: every scored epoch) side by side for each digit, shaded dark (early) to light (late) |
 
 The bar charts show accuracy by default. `--bar-value confidence` shows the classifier's mean confidence in its
 guess, and `--bar-value target-probability` shows the mean probability it gives the requested digit. In
-`digit-bars-stacked`, each digit's bars are drawn tallest at the back and shortest at the front, so every epoch stays
-visible. Each bar further forward is slightly narrower. Epochs
-with the same height (common with 16 samples per digit) share one bar, split into side-by-side stripes in epoch
-order, so a tie never hides an epoch. Colour follows time: a ramp from dark purple for the earliest chosen epoch
+`digit-bars-grouped`, each digit gets a group of thin, equal-width bars, one per epoch in order, so nothing
+overlaps. Choose a handful of epochs; dozens make the bars too thin to read. Colour follows time: a ramp from dark purple for the earliest chosen epoch
 to yellow-green for the latest, evenly spaced by order.
 
 Any numeric key in `<run>.jsonl`, such as `best_validation_loss`, also works as a panel. With no `-p`, every panel

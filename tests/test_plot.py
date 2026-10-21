@@ -84,15 +84,15 @@ def test_digit_bars_one_file_per_epoch(metrics_dir, tmp_path):
 
 @pytest.mark.parametrize("value", ["accuracy", "confidence", "target-probability"])
 def test_bar_values(metrics_dir, tmp_path, value):
-    for panel in ("digit-bars", "digit-bars-stacked"):
+    for panel in ("digit-bars", "digit-bars-grouped"):
         output = tmp_path / f"{panel}-{value}.svg"
         main(["--run", "b", "--metrics-dir", str(metrics_dir), "-o", str(output), "-p", panel, "--bar-value", value])
         assert output.stat().st_size > 0
 
 
-def test_stacked_bars_use_the_chosen_epochs(metrics_dir, tmp_path):
-    output = tmp_path / "stacked.svg"
-    args = ["--run", "b", "--metrics-dir", str(metrics_dir), "-o", str(output), "-p", "digit-bars-stacked"]
+def test_grouped_bars_use_the_chosen_epochs(metrics_dir, tmp_path):
+    output = tmp_path / "grouped.svg"
+    args = ["--run", "b", "--metrics-dir", str(metrics_dir), "-o", str(output), "-p", "digit-bars-grouped"]
     main([*args, "--epoch", "3", "2"])
     assert "epochs 2, 3" in output.read_text()
     with pytest.raises(SystemExit, match="no classifier samples for epoch 1"):
@@ -114,13 +114,14 @@ def test_digit_maps(metrics_dir, tmp_path, panel):
     assert output.stat().st_size > 0
 
 
-def test_tied_epochs_share_a_bar_as_stripes(metrics_dir):
+def test_grouped_epochs_sit_side_by_side(metrics_dir):
     import matplotlib.pyplot as plt
 
-    from generator.plot import plot_digit_bars_stacked
+    from generator.plot import plot_digit_bars_grouped
 
     fig, ax = plt.subplots()
-    plot_digit_bars_stacked(ax, load_run("b", metrics_dir), [2, 3])  # every digit scores the same in both epochs
-    widths = sorted({round(bar.get_width(), 6) for bar in ax.patches if bar.get_height() > 0})
+    plot_digit_bars_grouped(ax, load_run("b", metrics_dir), [2, 3])
+    digit_0 = sorted((bar.get_x(), bar.get_x() + bar.get_width()) for bar in ax.patches if bar.get_x() < 0.5)
     plt.close(fig)
-    assert widths == [0.4]  # each epoch half of the 0.8 bar, side by side, rather than one hiding the other
+    assert len(digit_0) == 2
+    assert digit_0[0][1] == pytest.approx(digit_0[1][0])  # touching, not overlapping

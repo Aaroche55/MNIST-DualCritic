@@ -9,7 +9,7 @@ Usage (from the repository root)::
     uv run python -m generator.plot --run ddpm --separate --format svg  # one file per panel, for slides
     uv run python -m generator.plot --run ddpm -p digit-bars --separate # a bar chart for every scored epoch
     uv run python -m generator.plot --run ddpm -p digit-bars --epoch 1 10 20 --columns 3
-    uv run python -m generator.plot --run ddpm -p digit-bars-stacked --epoch 5 15 25 --bar-value confidence
+    uv run python -m generator.plot --run ddpm -p digit-bars-grouped --epoch 5 15 25 --bar-value confidence
     uv run python -m generator.plot --run ddpm --list                   # what can be plotted
 
 Runs are read from outputs/metrics/<run>.jsonl (per-epoch losses and classifier summary) and
@@ -270,29 +270,18 @@ def epoch_colours(epochs: list[int]) -> dict[int, tuple]:
     return {e: tuple(c) for e, c in zip(sorted(epochs), ramp, strict=True)}
 
 
-def plot_digit_bars_stacked(ax, run: Run, epochs: list[int], value: str = "accuracy", **_):
-    """Several epochs overlapped on one bar chart, coloured dark (early) to light (late).
-
-    For every digit the tallest bar is drawn at the back and the shortest at the front, each a little narrower, so
-    every height stays visible. Epochs with the same height (common with 16 samples per digit) share one bar, split
-    into side-by-side stripes in epoch order, so a tie never hides an epoch behind another.
-    """
+def plot_digit_bars_grouped(ax, run: Run, epochs: list[int], value: str = "accuracy", **_):
+    """Several epochs side by side for each digit, histogram style: thin equal bars in epoch order, coloured dark
+    (early) to light (late), so nothing overlaps and each digit's group reads left to right through training."""
     key = BAR_VALUES[value][0]
     epochs = sorted(epochs)
-    heights = {e: digit_means(epoch_samples(run, e), key)[0] for e in epochs}
     colour = epoch_colours(epochs)
-    for digit in DIGITS:
-        ties: dict[float, list[int]] = {}
-        for epoch in epochs:  # in epoch order, so stripes run early (left) to late (right)
-            ties.setdefault(round(float(heights[epoch][digit]), 6), []).append(epoch)
-        levels = sorted(ties, reverse=True)
-        widths = np.linspace(0.8, 0.5, len(levels)) if len(levels) > 1 else [0.8]
-        for depth, height in enumerate(levels):
-            tied, width = ties[height], widths[depth]
-            stripe = width / len(tied)
-            for i, epoch in enumerate(tied):
-                ax.bar(digit - width / 2 + (i + 0.5) * stripe, height, width=stripe, color=colour[epoch],
-                       edgecolor="white", linewidth=0.5, zorder=2 + depth)  # fmt: skip
+    span = 0.85  # of each digit's slot; the rest is the gap between digits
+    width = span / len(epochs)
+    for i, epoch in enumerate(epochs):
+        heights, _ = digit_means(epoch_samples(run, epoch), key)
+        x = np.array(DIGITS) - span / 2 + (i + 0.5) * width
+        ax.bar(x, heights, width=width, color=colour[epoch], zorder=2)
     handles = [plt.Rectangle((0, 0), 1, 1, color=colour[e]) for e in epochs]
     ax.legend(handles, [f"epoch {e}" for e in epochs], loc="upper left", bbox_to_anchor=(1.01, 1), fontsize="small",
               ncol=1 + len(epochs) // 13)  # fmt: skip
@@ -306,10 +295,12 @@ def plot_confusion(ax, run: Run, epoch: int, **_):
     matrix = np.zeros((10, 10), dtype=int)
     for s in rows:
         matrix[s["target"], s["predicted"]] += 1
-    ax.imshow(matrix, cmap="Blues")
+    # Shade on a fixed 0 to samples-per-digit scale, so the same blue means the same count in every epoch's matrix
+    full = matrix.sum(axis=1).max()
+    ax.imshow(matrix, cmap="Blues", vmin=0, vmax=full)
     for (i, j), count in np.ndenumerate(matrix):
         if count:
-            colour = "white" if count > matrix.max() / 2 else "black"
+            colour = "white" if count > full / 2 else "black"
             ax.text(j, i, count, ha="center", va="center", color=colour, fontsize="small")
     ax.set_xticks(DIGITS)
     ax.set_yticks(DIGITS)
@@ -340,10 +331,10 @@ PANELS = {
     "digit-confidence-map": (plot_digit_confidence_map, "samples", "mean confidence as a digit-by-epoch heatmap"),
     "confusion": (plot_confusion, "latest", "requested digit against the classifier's guess, per --epoch"),
     "digit-bars": (plot_digit_bars, "each", "bar chart per digit (--bar-value), one per epoch (or per --epoch)"),
-    "digit-bars-stacked": (
-        plot_digit_bars_stacked,
+    "digit-bars-grouped": (
+        plot_digit_bars_grouped,
         "together",
-        "the --epoch epochs (default: all) overlapped on one bar chart",
+        "the --epoch epochs (default: all) side by side for each digit, on one bar chart",
     ),
 }
 DEFAULT_PANELS = ["loss", "accuracy", "confidence", "digit-accuracy", "confusion"]
