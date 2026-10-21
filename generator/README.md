@@ -237,8 +237,9 @@ uv run python -m generator.plot --run ddpm -p digit-bars-stacked --bar-value con
 The bar charts show accuracy by default. `--bar-value confidence` shows the classifier's mean confidence in its
 guess, and `--bar-value target-probability` shows the mean probability it gives the requested digit. In
 `digit-bars-stacked`, each digit's bars are drawn tallest at the back and shortest at the front, so every epoch stays
-visible. Each bar further forward is slightly narrower, so an epoch that ties a later one (common with 16 samples
-per digit) still shows as a coloured rim. Colour follows time: a ramp from dark purple for the earliest chosen epoch
+visible. Each bar further forward is slightly narrower. Epochs
+with the same height (common with 16 samples per digit) share one bar, split into side-by-side stripes in epoch
+order, so a tie never hides an epoch. Colour follows time: a ramp from dark purple for the earliest chosen epoch
 to yellow-green for the latest, evenly spaced by order.
 
 Any numeric key in `<run>.jsonl`, such as `best_validation_loss`, also works as a panel. With no `-p`, every panel

@@ -271,19 +271,28 @@ def epoch_colours(epochs: list[int]) -> dict[int, tuple]:
 
 
 def plot_digit_bars_stacked(ax, run: Run, epochs: list[int], value: str = "accuracy", **_):
-    """Several epochs overlapped on one bar chart, coloured dark (early) to light (late). For every digit the tallest bar is drawn at
-    the back and the shortest at the front, so each epoch's height stays visible; each bar further forward is a
-    little narrower, so an epoch tied with a later one still shows as a coloured rim."""
+    """Several epochs overlapped on one bar chart, coloured dark (early) to light (late).
+
+    For every digit the tallest bar is drawn at the back and the shortest at the front, each a little narrower, so
+    every height stays visible. Epochs with the same height (common with 16 samples per digit) share one bar, split
+    into side-by-side stripes in epoch order, so a tie never hides an epoch behind another.
+    """
     key = BAR_VALUES[value][0]
     epochs = sorted(epochs)
     heights = {e: digit_means(epoch_samples(run, e), key)[0] for e in epochs}
     colour = epoch_colours(epochs)
-    widths = np.linspace(0.8, 0.5, len(epochs)) if len(epochs) > 1 else [0.8]
     for digit in DIGITS:
-        # Ties keep epoch order, so the later epoch sits in front
-        for depth, epoch in enumerate(sorted(epochs, key=lambda e: -heights[e][digit])):
-            ax.bar(digit, heights[epoch][digit], width=widths[depth], color=colour[epoch], edgecolor="white",
-                   linewidth=0.5, zorder=2 + depth)  # fmt: skip
+        ties: dict[float, list[int]] = {}
+        for epoch in epochs:  # in epoch order, so stripes run early (left) to late (right)
+            ties.setdefault(round(float(heights[epoch][digit]), 6), []).append(epoch)
+        levels = sorted(ties, reverse=True)
+        widths = np.linspace(0.8, 0.5, len(levels)) if len(levels) > 1 else [0.8]
+        for depth, height in enumerate(levels):
+            tied, width = ties[height], widths[depth]
+            stripe = width / len(tied)
+            for i, epoch in enumerate(tied):
+                ax.bar(digit - width / 2 + (i + 0.5) * stripe, height, width=stripe, color=colour[epoch],
+                       edgecolor="white", linewidth=0.5, zorder=2 + depth)  # fmt: skip
     handles = [plt.Rectangle((0, 0), 1, 1, color=colour[e]) for e in epochs]
     ax.legend(handles, [f"epoch {e}" for e in epochs], loc="upper left", bbox_to_anchor=(1.01, 1), fontsize="small",
               ncol=1 + len(epochs) // 13)  # fmt: skip

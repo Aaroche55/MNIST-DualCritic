@@ -112,3 +112,15 @@ def test_digit_maps(metrics_dir, tmp_path, panel):
     output = tmp_path / f"{panel}.svg"
     main(["--run", "b", "--metrics-dir", str(metrics_dir), "-o", str(output), "-p", panel])
     assert output.stat().st_size > 0
+
+
+def test_tied_epochs_share_a_bar_as_stripes(metrics_dir):
+    import matplotlib.pyplot as plt
+
+    from generator.plot import plot_digit_bars_stacked
+
+    fig, ax = plt.subplots()
+    plot_digit_bars_stacked(ax, load_run("b", metrics_dir), [2, 3])  # every digit scores the same in both epochs
+    widths = sorted({round(bar.get_width(), 6) for bar in ax.patches if bar.get_height() > 0})
+    plt.close(fig)
+    assert widths == [0.4]  # each epoch half of the 0.8 bar, side by side, rather than one hiding the other
